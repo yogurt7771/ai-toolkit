@@ -76,10 +76,10 @@ export default function JobLossGraph({ job }: Props) {
   const [smoothing, setSmoothing] = useState(90);
 
   // UI-only downsample for rendering speed
-  const [plotStride, setPlotStride] = useState(1);
+  const [plotStride, setPlotStride] = useState(10);
 
   // show only last N points in the chart (0 = all)
-  const [windowSize, setWindowSize] = useState<number>(4000);
+  const [windowSize, setWindowSize] = useState<number>(0);
 
   // quick y clipping for readability
   const [clipOutliers, setClipOutliers] = useState(false);
@@ -381,7 +381,7 @@ export default function JobLossGraph({ job }: Props) {
             <input
               type="range"
               min={1}
-              max={20}
+              max={250}
               value={plotStride}
               onChange={e => setPlotStride(Number(e.target.value))}
               className="w-full accent-blue-500"
