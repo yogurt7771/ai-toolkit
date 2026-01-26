@@ -8,6 +8,7 @@ torch.backends.cudnn.deterministic = False
 
 _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
 
+
 def _sdpa_with_priority(*args, **kwargs):
     with torch.nn.attention.sdpa_kernel(
         [
