@@ -126,205 +126,197 @@ class ConceptSliderTrainer(DiffusionTrainer):
         base_timesteps = timesteps
 
         num_sliders = max(1, len(self.sliders))
-        loss_scale = 1.0 / float(num_sliders)
+        slider_idx = torch.randint(0, num_sliders, (1,)).item()
+        slider = self.sliders[slider_idx]
+        # do out prior preds first
+        with torch.no_grad():
+            positive_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("positive")
+            target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
+            negative_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("negative")
+            anchor_class_embeds = self.slider_prompt_embeds[slider_idx].get("anchor")
+            self.sd.unet.eval()
+            noisy_latents = base_noisy_latents
 
-        all_total_loss = 0
-        for slider_idx, slider in enumerate(self.sliders):
-            # 确保“基准预测”(no_grad) 一定是在 LoRA 关闭状态下进行
+            batch_size = noisy_latents.shape[0]
+
+            positive_embeds = concat_prompt_embeds(
+                [positive_prompt_embeds] * batch_size
+            ).to(self.device_torch, dtype=dtype)
+            target_class_embeds = concat_prompt_embeds(
+                [target_class_embeds] * batch_size
+            ).to(self.device_torch, dtype=dtype)
+            negative_embeds = concat_prompt_embeds(
+                [negative_prompt_embeds] * batch_size
+            ).to(self.device_torch, dtype=dtype)
+
+            if anchor_class_embeds is not None:
+                anchor_embeds = concat_prompt_embeds(
+                    [anchor_class_embeds] * batch_size
+                ).to(self.device_torch, dtype=dtype)
+
+            if anchor_class_embeds is not None:
+                # if we have an anchor, do it
+                combo_embeds = concat_prompt_embeds(
+                    [
+                        positive_embeds,
+                        target_class_embeds,
+                        negative_embeds,
+                        anchor_embeds,
+                    ]
+                )
+                num_embeds = 4
+            else:
+                combo_embeds = concat_prompt_embeds(
+                    [positive_embeds, target_class_embeds, negative_embeds]
+                )
+                num_embeds = 3
+
+            # do them in one batch, VRAM should handle it since we are no grad
+            combo_pred = self.sd.predict_noise(
+                latents=torch.cat([noisy_latents] * num_embeds, dim=0),
+                conditional_embeddings=combo_embeds,
+                timestep=torch.cat([base_timesteps] * num_embeds, dim=0),
+                guidance_scale=1.0,
+                guidance_embedding_scale=1.0,
+                batch=batch,
+            )
+
+            if anchor_class_embeds is not None:
+                positive_pred, neutral_pred, negative_pred, anchor_target = (
+                    combo_pred.chunk(4, dim=0)
+                )
+            else:
+                anchor_target = None
+                positive_pred, neutral_pred, negative_pred = combo_pred.chunk(3, dim=0)
+
+            # calculate the targets
+            guidance_scale = slider.guidance_strength
+
+            # enhance_positive_target = neutral_pred + guidance_scale * (
+            #     positive_pred - negative_pred
+            # )
+            # enhance_negative_target = neutral_pred + guidance_scale * (
+            #     negative_pred - positive_pred
+            # )
+            # erase_negative_target = neutral_pred - guidance_scale * (
+            #     negative_pred - positive_pred
+            # )
+            # erase_positive_target = neutral_pred - guidance_scale * (
+            #     positive_pred - negative_pred
+            # )
+
+            positive = (positive_pred - neutral_pred) - (negative_pred - neutral_pred)
+            negative = (negative_pred - neutral_pred) - (positive_pred - neutral_pred)
+
+            enhance_positive_target = neutral_pred + guidance_scale * positive
+            enhance_negative_target = neutral_pred + guidance_scale * negative
+            erase_negative_target = neutral_pred - guidance_scale * negative
+            erase_positive_target = neutral_pred - guidance_scale * positive
+
+            # normalize to neutral std/mean
+            enhance_positive_target = norm_like_tensor(
+                enhance_positive_target, neutral_pred
+            )
+            enhance_negative_target = norm_like_tensor(
+                enhance_negative_target, neutral_pred
+            )
+            erase_negative_target = norm_like_tensor(
+                erase_negative_target, neutral_pred
+            )
+            erase_positive_target = norm_like_tensor(
+                erase_positive_target, neutral_pred
+            )
+
+            if was_unet_training:
+                self.sd.unet.train()
+
+            # restore network
             if self.network is not None:
-                self.network.is_active = False
-
-            # do out prior preds first
-            with torch.no_grad():
-                positive_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("positive")
-                target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
-                negative_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("negative")
-                anchor_class_embeds = self.slider_prompt_embeds[slider_idx].get("anchor")
-                self.sd.unet.eval()
-                noisy_latents = base_noisy_latents
-
-                batch_size = noisy_latents.shape[0]
-
-                positive_embeds = concat_prompt_embeds(
-                    [positive_prompt_embeds] * batch_size
-                ).to(self.device_torch, dtype=dtype)
-                target_class_embeds = concat_prompt_embeds(
-                    [target_class_embeds] * batch_size
-                ).to(self.device_torch, dtype=dtype)
-                negative_embeds = concat_prompt_embeds(
-                    [negative_prompt_embeds] * batch_size
-                ).to(self.device_torch, dtype=dtype)
-
-                if anchor_class_embeds is not None:
-                    anchor_embeds = concat_prompt_embeds(
-                        [anchor_class_embeds] * batch_size
-                    ).to(self.device_torch, dtype=dtype)
-
-                if anchor_class_embeds is not None:
-                    # if we have an anchor, do it
-                    combo_embeds = concat_prompt_embeds(
-                        [
-                            positive_embeds,
-                            target_class_embeds,
-                            negative_embeds,
-                            anchor_embeds,
-                        ]
-                    )
-                    num_embeds = 4
-                else:
-                    combo_embeds = concat_prompt_embeds(
-                        [positive_embeds, target_class_embeds, negative_embeds]
-                    )
-                    num_embeds = 3
-
-                # do them in one batch, VRAM should handle it since we are no grad
-                combo_pred = self.sd.predict_noise(
-                    latents=torch.cat([noisy_latents] * num_embeds, dim=0),
-                    conditional_embeddings=combo_embeds,
-                    timestep=torch.cat([base_timesteps] * num_embeds, dim=0),
-                    guidance_scale=1.0,
-                    guidance_embedding_scale=1.0,
-                    batch=batch,
-                )
-
-                if anchor_class_embeds is not None:
-                    positive_pred, neutral_pred, negative_pred, anchor_target = (
-                        combo_pred.chunk(4, dim=0)
-                    )
-                else:
-                    anchor_target = None
-                    positive_pred, neutral_pred, negative_pred = combo_pred.chunk(3, dim=0)
-
-                # calculate the targets
-                guidance_scale = slider.guidance_strength
-
-                # enhance_positive_target = neutral_pred + guidance_scale * (
-                #     positive_pred - negative_pred
-                # )
-                # enhance_negative_target = neutral_pred + guidance_scale * (
-                #     negative_pred - positive_pred
-                # )
-                # erase_negative_target = neutral_pred - guidance_scale * (
-                #     negative_pred - positive_pred
-                # )
-                # erase_positive_target = neutral_pred - guidance_scale * (
-                #     positive_pred - negative_pred
-                # )
-
-                positive = (positive_pred - neutral_pred) - (negative_pred - neutral_pred)
-                negative = (negative_pred - neutral_pred) - (positive_pred - neutral_pred)
-
-                enhance_positive_target = neutral_pred + guidance_scale * positive
-                enhance_negative_target = neutral_pred + guidance_scale * negative
-                erase_negative_target = neutral_pred - guidance_scale * negative
-                erase_positive_target = neutral_pred - guidance_scale * positive
-
-                # normalize to neutral std/mean
-                enhance_positive_target = norm_like_tensor(
-                    enhance_positive_target, neutral_pred
-                )
-                enhance_negative_target = norm_like_tensor(
-                    enhance_negative_target, neutral_pred
-                )
-                erase_negative_target = norm_like_tensor(
-                    erase_negative_target, neutral_pred
-                )
-                erase_positive_target = norm_like_tensor(
-                    erase_positive_target, neutral_pred
-                )
-
-                if was_unet_training:
-                    self.sd.unet.train()
-
-                # restore network
-                if self.network is not None:
-                    self.network.is_active = was_network_active
-
-                if anchor_class_embeds is not None:
-                    # do a grad inference with our target prompt
-                    embeds = concat_prompt_embeds([target_class_embeds, anchor_embeds]).to(
-                        self.device_torch, dtype=dtype
-                    )
-
-                    noisy_latents_for_pred = torch.cat([noisy_latents, noisy_latents], dim=0).to(
-                        self.device_torch, dtype=dtype
-                    )
-                    timesteps_for_pred = torch.cat([base_timesteps, base_timesteps], dim=0)
-                else:
-                    embeds = target_class_embeds.to(self.device_torch, dtype=dtype)
-                    noisy_latents_for_pred = noisy_latents
-                    timesteps_for_pred = base_timesteps
-
-            # do positive first
-            self.network.set_multiplier(slider.multiplier)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents_for_pred,
-                conditional_embeddings=embeds,
-                timestep=timesteps_for_pred,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
+                self.network.is_active = was_network_active
 
             if anchor_class_embeds is not None:
-                class_pred, anchor_pred = pred.chunk(2, dim=0)
+                # do a grad inference with our target prompt
+                embeds = concat_prompt_embeds([target_class_embeds, anchor_embeds]).to(
+                    self.device_torch, dtype=dtype
+                )
+
+                noisy_latents_for_pred = torch.cat([noisy_latents, noisy_latents], dim=0).to(
+                    self.device_torch, dtype=dtype
+                )
+                timesteps_for_pred = torch.cat([base_timesteps, base_timesteps], dim=0)
             else:
-                class_pred = pred
-                anchor_pred = None
+                embeds = target_class_embeds.to(self.device_torch, dtype=dtype)
+                noisy_latents_for_pred = noisy_latents
+                timesteps_for_pred = base_timesteps
 
-            # enhance positive loss
-            enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_positive_target)
+        # do positive first
+        self.network.set_multiplier(slider.multiplier)
+        pred = self.sd.predict_noise(
+            latents=noisy_latents_for_pred,
+            conditional_embeddings=embeds,
+            timestep=timesteps_for_pred,
+            guidance_scale=1.0,
+            guidance_embedding_scale=1.0,
+            batch=batch,
+        )
 
-            erase_loss = torch.nn.functional.mse_loss(class_pred, erase_negative_target)
+        if anchor_class_embeds is not None:
+            class_pred, anchor_pred = pred.chunk(2, dim=0)
+        else:
+            class_pred = pred
+            anchor_pred = None
 
-            if anchor_target is None:
-                anchor_loss = torch.zeros_like(erase_loss)
-            else:
-                anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
+        # enhance positive loss
+        enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_positive_target)
 
-            anchor_loss = anchor_loss * slider.anchor_strength
+        erase_loss = torch.nn.functional.mse_loss(class_pred, erase_negative_target)
 
-            # send backward now because gradient checkpointing needs network polarity intact
-            total_pos_loss = ((enhance_loss + erase_loss + anchor_loss) / 3.0) * loss_scale
-            total_pos_loss.backward()
-            total_pos_loss = total_pos_loss.detach()
+        if anchor_target is None:
+            anchor_loss = torch.zeros_like(erase_loss)
+        else:
+            anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
 
-            # now do negative
-            self.network.set_multiplier(-slider.multiplier)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents_for_pred,
-                conditional_embeddings=embeds,
-                timestep=timesteps_for_pred,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
+        anchor_loss = anchor_loss * slider.anchor_strength
 
-            if anchor_class_embeds is not None:
-                class_pred, anchor_pred = pred.chunk(2, dim=0)
-            else:
-                class_pred = pred
-                anchor_pred = None
+        # send backward now because gradient checkpointing needs network polarity intact
+        total_pos_loss = ((enhance_loss + erase_loss + anchor_loss) / 3.0)
+        total_pos_loss.backward()
+        total_pos_loss = total_pos_loss.detach()
 
-            # enhance negative loss
-            enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_negative_target)
-            erase_loss = torch.nn.functional.mse_loss(class_pred, erase_positive_target)
+        # now do negative
+        self.network.set_multiplier(-slider.multiplier)
+        pred = self.sd.predict_noise(
+            latents=noisy_latents_for_pred,
+            conditional_embeddings=embeds,
+            timestep=timesteps_for_pred,
+            guidance_scale=1.0,
+            guidance_embedding_scale=1.0,
+            batch=batch,
+        )
 
-            if anchor_target is None:
-                anchor_loss = torch.zeros_like(erase_loss)
-            else:
-                anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
-            anchor_loss = anchor_loss * slider.anchor_strength
-            total_neg_loss = ((enhance_loss + erase_loss + anchor_loss) / 3.0) * loss_scale
-            total_neg_loss.backward()
-            total_neg_loss = total_neg_loss.detach()
+        if anchor_class_embeds is not None:
+            class_pred, anchor_pred = pred.chunk(2, dim=0)
+        else:
+            class_pred = pred
+            anchor_pred = None
 
-            self.network.set_multiplier(1.0)
+        # enhance negative loss
+        enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_negative_target)
+        erase_loss = torch.nn.functional.mse_loss(class_pred, erase_positive_target)
 
-            total_loss = (total_pos_loss + total_neg_loss) / 2.0
+        if anchor_target is None:
+            anchor_loss = torch.zeros_like(erase_loss)
+        else:
+            anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
+        anchor_loss = anchor_loss * slider.anchor_strength
+        total_neg_loss = ((enhance_loss + erase_loss + anchor_loss) / 3.0)
+        total_neg_loss.backward()
+        total_neg_loss = total_neg_loss.detach()
 
-            all_total_loss += total_loss
+        self.network.set_multiplier(1.0)
+
+        total_loss = (total_pos_loss + total_neg_loss) / 2.0
 
         # add a grad so backward works right
-        all_total_loss.requires_grad_(True)
-        return all_total_loss
+        total_loss.requires_grad_(True)
+        return total_loss
