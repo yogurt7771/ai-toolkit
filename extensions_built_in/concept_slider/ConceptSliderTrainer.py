@@ -130,7 +130,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         slider_idx = torch.randint(0, num_sliders, (1,)).item()
         self.slider = self.sliders[slider_idx]
         self.positive_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("positive")
-        target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
+        self.target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
         self.negative_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("negative")
         self.anchor_class_embeds = self.slider_prompt_embeds[slider_idx].get("anchor")
         # do out prior preds first
