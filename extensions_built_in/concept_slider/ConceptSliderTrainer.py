@@ -15,6 +15,7 @@ class ConceptSliderTrainerConfig:
         self.anchor_strength: float = kwargs.get("anchor_strength", 1.0)
         self.positive_prompt: str = kwargs.get("positive_prompt", "")
         self.negative_prompt: str = kwargs.get("negative_prompt", "")
+        self.neutral_prompt: str = kwargs.get("neutral_prompt", "")
         self.target_class: str = kwargs.get("target_class", "")
         self.anchor_class: Optional[str] = kwargs.get("anchor_class", None)
         self.multiplier: float = float(kwargs.get("multiplier", 1.0))
@@ -42,6 +43,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self.slider: ConceptSliderTrainerConfig = None
         self.positive_prompt_embeds: Optional[PromptEmbeds] = None
         self.negative_prompt_embeds: Optional[PromptEmbeds] = None
+        self.neutral_prompt_embeds: Optional[PromptEmbeds] = None
         self.target_class_embeds: Optional[PromptEmbeds] = None
         self.anchor_class_embeds: Optional[PromptEmbeds] = None
         slider_raw = self.config.get("slider", {})
@@ -82,6 +84,12 @@ class ConceptSliderTrainer(DiffusionTrainer):
                     .detach()
                 )
 
+                neutral_prompt_embeds = (
+                    self.sd.encode_prompt([s.neutral_prompt if s.neutral_prompt else s.target_class])
+                    .to(self.device_torch, dtype=self.sd.torch_dtype)
+                    .detach()
+                )
+
                 negative_prompt_embeds = (
                     self.sd.encode_prompt([s.negative_prompt])
                     .to(self.device_torch, dtype=self.sd.torch_dtype)
@@ -101,6 +109,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
                         "positive": positive_prompt_embeds,
                         "target": target_class_embeds,
                         "negative": negative_prompt_embeds,
+                        "neutral": neutral_prompt_embeds,
                         "anchor": anchor_class_embeds,
                     }
                 )
@@ -134,6 +143,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self.positive_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("positive")
         self.target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
         self.negative_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("negative")
+        self.neutral_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("neutral")
         self.anchor_class_embeds = self.slider_prompt_embeds[slider_idx].get("anchor")
         # do out prior preds first
         with torch.no_grad():
@@ -152,6 +162,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
             negative_embeds = concat_prompt_embeds(
                 [self.negative_prompt_embeds] * batch_size
             ).to(self.device_torch, dtype=dtype)
+            neutral_embeds = concat_prompt_embeds(
+                [self.neutral_prompt_embeds] * batch_size
+            ).to(self.device_torch, dtype=dtype)
 
             if self.anchor_class_embeds is not None:
                 anchor_embeds = concat_prompt_embeds(
@@ -163,7 +176,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 combo_embeds = concat_prompt_embeds(
                     [
                         positive_embeds,
-                        target_class_embeds,
+                        neutral_embeds,
                         negative_embeds,
                         anchor_embeds,
                     ]
@@ -171,7 +184,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 num_embeds = 4
             else:
                 combo_embeds = concat_prompt_embeds(
-                    [positive_embeds, target_class_embeds, negative_embeds]
+                    [positive_embeds, neutral_embeds, negative_embeds]
                 )
                 num_embeds = 3
 
@@ -283,6 +296,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         with torch.no_grad():
             # now do negative
+            self.sd.unet.eval()
             self.network.set_multiplier(m - self.slider.linearity_delta)
             pred = self.sd.predict_noise(
                 latents=noisy_latents,
@@ -313,6 +327,8 @@ class ConceptSliderTrainer(DiffusionTrainer):
             else:
                 class_pred_right = pred
                 anchor_pred = None
+            if was_unet_training:
+                self.sd.unet.train()
         self.network.set_multiplier(m)
         linearity_pos_loss = torch.nn.functional.mse_loss(class_pred, (class_pred_left + class_pred_right) / 2.0) * self.slider.linearity_weight
 
@@ -351,6 +367,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         with torch.no_grad():
             # now do negative
+            self.sd.unet.eval()
             self.network.set_multiplier(m - self.slider.linearity_delta)
             pred = self.sd.predict_noise(
                 latents=noisy_latents,
@@ -381,6 +398,8 @@ class ConceptSliderTrainer(DiffusionTrainer):
             else:
                 class_pred_right = pred
                 anchor_pred = None
+            if was_unet_training:
+                self.sd.unet.train()
         self.network.set_multiplier(m)
         linearity_neg_loss = torch.nn.functional.mse_loss(class_pred, (class_pred_left + class_pred_right) / 2.0) * self.slider.linearity_weight
 
