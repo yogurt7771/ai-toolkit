@@ -21,6 +21,7 @@ class ConceptSliderTrainerConfig:
         self.multiplier: float = float(kwargs.get("multiplier", 1.0))
         self.linearity_weight: float = float(kwargs.get("linearity_weight", 0.1))
         self.linearity_delta: float = float(kwargs.get("linearity_delta", 0.1))
+        self.linearity_loss_type: str = str(kwargs.get("linearity_loss_type", "mae"))
 
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -333,8 +334,14 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 self.sd.unet.train()
         self.network.set_multiplier(m)
         linearity_mid = (class_pred_left + class_pred_right) / 2.0
-        linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-        linearity_pos_loss = (linearity_loss * linearity_weight).mean()
+        if self.slider.linearity_loss_type == "mae":
+            linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+            linearity_pos_loss = (linearity_loss * linearity_weight).mean()
+        elif self.slider.linearity_loss_type == "mse":
+            linearity_loss = torch.nn.functional.mse_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+            linearity_pos_loss = (linearity_loss * linearity_weight).mean()
+        else:
+            linearity_pos_loss = torch.zeros_like(enhance_loss)
 
         # send backward now because gradient checkpointing needs network polarity intact
         total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss
@@ -406,8 +413,14 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 self.sd.unet.train()
         self.network.set_multiplier(m)
         linearity_mid = (class_pred_left + class_pred_right) / 2.0
-        linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-        linearity_neg_loss = (linearity_loss * linearity_weight).mean()
+        if self.slider.linearity_loss_type == "mae":
+            linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+            linearity_neg_loss = (linearity_loss * linearity_weight).mean()
+        elif self.slider.linearity_loss_type == "mse":
+            linearity_loss = torch.nn.functional.mse_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+            linearity_neg_loss = (linearity_loss * linearity_weight).mean()
+        else:
+            linearity_neg_loss = torch.zeros_like(erase_loss)
 
         total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss
         total_neg_loss.backward()
