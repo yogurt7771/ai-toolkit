@@ -244,6 +244,8 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 erase_positive_target, neutral_pred
             )
 
+            linearity_weight = self.slider.linearity_weight * (timesteps / 1000.0) ** 2
+
             if was_unet_training:
                 self.sd.unet.train()
 
@@ -330,7 +332,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
             if was_unet_training:
                 self.sd.unet.train()
         self.network.set_multiplier(m)
-        linearity_pos_loss = torch.nn.functional.mse_loss(class_pred, (class_pred_left + class_pred_right) / 2.0) * self.slider.linearity_weight
+        linearity_mid = (class_pred_left + class_pred_right) / 2.0
+        linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+        linearity_pos_loss = (linearity_loss * linearity_weight).mean()
 
         # send backward now because gradient checkpointing needs network polarity intact
         total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss
@@ -401,7 +405,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
             if was_unet_training:
                 self.sd.unet.train()
         self.network.set_multiplier(m)
-        linearity_neg_loss = torch.nn.functional.mse_loss(class_pred, (class_pred_left + class_pred_right) / 2.0) * self.slider.linearity_weight
+        linearity_mid = (class_pred_left + class_pred_right) / 2.0
+        linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
+        linearity_neg_loss = (linearity_loss * linearity_weight).mean()
 
         total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss
         total_neg_loss.backward()
