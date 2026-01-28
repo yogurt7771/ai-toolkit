@@ -21,7 +21,8 @@ class ConceptSliderTrainerConfig:
         self.multiplier: float = float(kwargs.get("multiplier", 1.0))
         self.linearity_weight: float = float(kwargs.get("linearity_weight", 0.1))
         self.linearity_delta: float = float(kwargs.get("linearity_delta", 0.1))
-        self.linearity_loss_type: str = str(kwargs.get("linearity_loss_type", "mae"))
+        self.linearity_loss_type: str = str(kwargs.get("linearity_loss_type", "smooth_l1"))
+        self.linearity_huber_beta: float = float(kwargs.get("linearity_huber_beta", 0.1))
 
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -117,6 +118,92 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         # call parent
         super().hook_before_train_loop()
+
+    def get_linearity_loss(
+        self,
+        noisy_latents,
+        embeds,
+        timesteps,
+        batch,
+        class_pred: torch.Tensor,
+        m,
+    ) -> torch.Tensor:
+        was_unet_training = self.sd.unet.training
+        old_m = self.network.multiplier
+
+        if self.anchor_class_embeds is not None:
+            # 把embeds和timestemps切成两半，因为外部传入的是concatenated的
+            timesteps, _ = timesteps.chunk(2, dim=0)
+            noisy_latents, _ = noisy_latents.chunk(2, dim=0)
+
+        t = timesteps.to(device=class_pred.device, dtype=class_pred.dtype)
+        linearity_weight = self.slider.linearity_weight * (t / 1000.0) ** 2
+        with torch.no_grad():
+            # do left pred
+            self.sd.unet.eval()
+            self.network.set_multiplier(m - self.slider.linearity_delta)
+            pred = self.sd.predict_noise(
+                latents=noisy_latents,
+                conditional_embeddings=embeds,
+                timestep=timesteps,
+                guidance_scale=1.0,
+                guidance_embedding_scale=1.0,
+                batch=batch,
+            )
+            class_pred_left = pred
+
+            # do right pred
+            self.network.set_multiplier(m + self.slider.linearity_delta)
+            pred = self.sd.predict_noise(
+                latents=noisy_latents,
+                conditional_embeddings=embeds,
+                timestep=timesteps,
+                guidance_scale=1.0,
+                guidance_embedding_scale=1.0,
+                batch=batch,
+            )
+            class_pred_right = pred
+
+        # restore unet training
+        if was_unet_training:
+            self.sd.unet.train()
+        # restore network multiplier
+        self.network.set_multiplier(old_m)
+
+        linearity_mid = (class_pred_left + class_pred_right) / 2.0
+
+        if self.slider.linearity_loss_type == "mae":
+            linearity_loss = (
+                torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none")
+                .flatten(start_dim=1)
+                .mean(dim=1)
+            )
+            linearity_loss = (linearity_loss * linearity_weight).mean()
+        elif self.slider.linearity_loss_type == "mse":
+            linearity_loss = (
+                torch.nn.functional.mse_loss(
+                    class_pred, linearity_mid, reduction="none"
+                )
+                .flatten(start_dim=1)
+                .mean(dim=1)
+            )
+            linearity_loss = (linearity_loss * linearity_weight).mean()
+        elif self.slider.linearity_loss_type == "smooth_l1":
+            with torch.no_grad():
+                abs_e = (class_pred.detach() - linearity_mid).abs().flatten().float()
+                beta_target = torch.quantile(abs_e, q=self.slider.linearity_huber_beta).item()
+
+            linearity_loss = (
+                torch.nn.functional.smooth_l1_loss(
+                    class_pred, linearity_mid, beta=float(beta_target), reduction="none"
+                )
+                .flatten(start_dim=1)
+                .mean(dim=1)
+            )
+            linearity_loss = (linearity_loss * linearity_weight).mean()
+        else:
+            linearity_loss = torch.zeros((), device=class_pred.device, dtype=class_pred.dtype)
+        return linearity_loss
 
     def get_guided_loss(
         self,
@@ -245,8 +332,6 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 erase_positive_target, neutral_pred
             )
 
-            linearity_weight = self.slider.linearity_weight * (timesteps / 1000.0) ** 2
-
             if was_unet_training:
                 self.sd.unet.train()
 
@@ -297,51 +382,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         anchor_loss = anchor_loss * self.slider.anchor_strength
 
-        with torch.no_grad():
-            # now do negative
-            self.sd.unet.eval()
-            self.network.set_multiplier(m - self.slider.linearity_delta)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents,
-                conditional_embeddings=embeds,
-                timestep=timesteps,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
-
-            if self.anchor_class_embeds is not None:
-                class_pred_left, anchor_pred = pred.chunk(2, dim=0)
-            else:
-                class_pred_left = pred
-                anchor_pred = None
-            self.network.set_multiplier(m + self.slider.linearity_delta)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents,
-                conditional_embeddings=embeds,
-                timestep=timesteps,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
-
-            if self.anchor_class_embeds is not None:
-                class_pred_right, anchor_pred = pred.chunk(2, dim=0)
-            else:
-                class_pred_right = pred
-                anchor_pred = None
-            if was_unet_training:
-                self.sd.unet.train()
-        self.network.set_multiplier(m)
-        linearity_mid = (class_pred_left + class_pred_right) / 2.0
-        if self.slider.linearity_loss_type == "mae":
-            linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-            linearity_pos_loss = (linearity_loss * linearity_weight).mean()
-        elif self.slider.linearity_loss_type == "mse":
-            linearity_loss = torch.nn.functional.mse_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-            linearity_pos_loss = (linearity_loss * linearity_weight).mean()
-        else:
-            linearity_pos_loss = torch.zeros_like(enhance_loss)
+        linearity_pos_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
         # send backward now because gradient checkpointing needs network polarity intact
         total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss
@@ -376,51 +417,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
             anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
         anchor_loss = anchor_loss * self.slider.anchor_strength
 
-        with torch.no_grad():
-            # now do negative
-            self.sd.unet.eval()
-            self.network.set_multiplier(m - self.slider.linearity_delta)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents,
-                conditional_embeddings=embeds,
-                timestep=timesteps,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
-
-            if self.anchor_class_embeds is not None:
-                class_pred_left, anchor_pred = pred.chunk(2, dim=0)
-            else:
-                class_pred_left = pred
-                anchor_pred = None
-            self.network.set_multiplier(m + self.slider.linearity_delta)
-            pred = self.sd.predict_noise(
-                latents=noisy_latents,
-                conditional_embeddings=embeds,
-                timestep=timesteps,
-                guidance_scale=1.0,
-                guidance_embedding_scale=1.0,
-                batch=batch,
-            )
-
-            if self.anchor_class_embeds is not None:
-                class_pred_right, anchor_pred = pred.chunk(2, dim=0)
-            else:
-                class_pred_right = pred
-                anchor_pred = None
-            if was_unet_training:
-                self.sd.unet.train()
-        self.network.set_multiplier(m)
-        linearity_mid = (class_pred_left + class_pred_right) / 2.0
-        if self.slider.linearity_loss_type == "mae":
-            linearity_loss = torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-            linearity_neg_loss = (linearity_loss * linearity_weight).mean()
-        elif self.slider.linearity_loss_type == "mse":
-            linearity_loss = torch.nn.functional.mse_loss(class_pred, linearity_mid, reduction="none").flatten(start_dim=1).mean(dim=1)
-            linearity_neg_loss = (linearity_loss * linearity_weight).mean()
-        else:
-            linearity_neg_loss = torch.zeros_like(erase_loss)
+        linearity_neg_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
         total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss
         total_neg_loss.backward()
