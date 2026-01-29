@@ -16,7 +16,7 @@ class ConceptSliderTrainerConfig:
         self.positive_prompt: str = kwargs.get("positive_prompt", "")
         self.negative_prompt: str = kwargs.get("negative_prompt", "")
         self.neutral_prompt: str = kwargs.get("neutral_prompt", "")
-        self.target_class: str = kwargs.get("target_class", "")
+        self.target_classes: list[str] = kwargs.get("target_class", [])
         self.anchor_class: Optional[str] = kwargs.get("anchor_class", None)
         self.multiplier: float = float(kwargs.get("multiplier", 1.0))
         self.linearity_weight: float = float(kwargs.get("linearity_weight", 0.1))
@@ -74,47 +74,48 @@ class ConceptSliderTrainer(DiffusionTrainer):
         with torch.no_grad():
             self.slider_prompt_embeds = []
             for s in self.sliders:
-                positive_prompt_embeds = (
-                    self.sd.encode_prompt([s.positive_prompt])
-                    .to(self.device_torch, dtype=self.sd.torch_dtype)
-                    .detach()
-                )
-
-                target_class_embeds = (
-                    self.sd.encode_prompt([s.target_class])
-                    .to(self.device_torch, dtype=self.sd.torch_dtype)
-                    .detach()
-                )
-
-                neutral_prompt_embeds = (
-                    self.sd.encode_prompt([s.neutral_prompt if s.neutral_prompt else s.target_class])
-                    .to(self.device_torch, dtype=self.sd.torch_dtype)
-                    .detach()
-                )
-
-                negative_prompt_embeds = (
-                    self.sd.encode_prompt([s.negative_prompt])
-                    .to(self.device_torch, dtype=self.sd.torch_dtype)
-                    .detach()
-                )
-
-                anchor_class_embeds: Optional[PromptEmbeds] = None
-                if s.anchor_class is not None:
-                    anchor_class_embeds = (
-                        self.sd.encode_prompt([s.anchor_class])
+                for target_class in s.target_classes:
+                    positive_prompt_embeds = (
+                        self.sd.encode_prompt([s.positive_prompt.replace("[target]", target_class)])
                         .to(self.device_torch, dtype=self.sd.torch_dtype)
                         .detach()
                     )
 
-                self.slider_prompt_embeds.append(
-                    {
-                        "positive": positive_prompt_embeds,
-                        "target": target_class_embeds,
-                        "negative": negative_prompt_embeds,
-                        "neutral": neutral_prompt_embeds,
-                        "anchor": anchor_class_embeds,
-                    }
-                )
+                    target_class_embeds = (
+                        self.sd.encode_prompt([target_class])
+                        .to(self.device_torch, dtype=self.sd.torch_dtype)
+                        .detach()
+                    )
+
+                    neutral_prompt_embeds = (
+                        self.sd.encode_prompt([s.neutral_prompt.replace("[target]", target_class) if s.neutral_prompt is not None else target_class])
+                        .to(self.device_torch, dtype=self.sd.torch_dtype)
+                        .detach()
+                    )
+
+                    negative_prompt_embeds = (
+                        self.sd.encode_prompt([s.negative_prompt.replace("[target]", target_class)])
+                        .to(self.device_torch, dtype=self.sd.torch_dtype)
+                        .detach()
+                    )
+
+                    anchor_class_embeds: Optional[PromptEmbeds] = None
+                    if s.anchor_class is not None:
+                        anchor_class_embeds = (
+                            self.sd.encode_prompt([s.anchor_class.replace("[target]", target_class)])
+                            .to(self.device_torch, dtype=self.sd.torch_dtype)
+                            .detach()
+                        )
+
+                    self.slider_prompt_embeds.append(
+                        {
+                            "positive": positive_prompt_embeds,
+                            "target": target_class_embeds,
+                            "negative": negative_prompt_embeds,
+                            "neutral": neutral_prompt_embeds,
+                            "anchor": anchor_class_embeds,
+                        }
+                    )
 
         # call parent
         super().hook_before_train_loop()
@@ -204,6 +205,58 @@ class ConceptSliderTrainer(DiffusionTrainer):
         else:
             linearity_loss = torch.zeros((), device=class_pred.device, dtype=class_pred.dtype)
         return linearity_loss
+
+    def color_cast_loss_gated(
+        self,
+        pred_a: torch.Tensor,
+        pred_b: torch.Tensor,
+        *,
+        kernel_size: int = 3,
+        weight: float = 1.0,
+        loss: str = "huber",      # "huber" or "charbonnier" or "mse"
+        huber_beta: float = 0.1,
+        charbonnier_eps: float = 1e-3,
+    ) -> torch.Tensor:
+        """
+        仅低频抑制的“色彩偏移”惩罚（pred 域）。
+        - 先对 pred 差分做低通（avg pool 到 ~down_to）
+        - 再取全局通道均值（B,C）
+        - 去掉亮度公共分量，只惩罚通道间差异（chroma cast）
+        - 用平滑损失聚合为标量
+
+        pred_a/pred_b: (B,C,H,W)
+        """
+        if pred_a.shape != pred_b.shape:
+            raise ValueError(f"Shape mismatch: {pred_a.shape} vs {pred_b.shape}")
+        if pred_a.ndim != 4:
+            raise ValueError(f"Expected (B,C,H,W), got {pred_a.shape}")
+
+        d = pred_a - pred_b  # (B,C,H,W)
+
+        d_lp = torch.nn.functional.avg_pool2d(d, kernel_size=kernel_size, stride=(kernel_size + 1) // 2)
+
+        # --- chroma mean shift (remove luminance component) ---
+        mean_shift = d_lp.mean(dim=(2, 3))                       # (B,C)
+        chroma = mean_shift - mean_shift.mean(dim=1, keepdim=True)  # (B,C)
+
+        # --- smooth penalty ---
+        if loss == "mse":
+            chroma_cast_per = (chroma ** 2).mean(dim=1)  # (B,)
+            luma_cast_per = (mean_shift ** 2).mean(dim=1)  # (B,)
+        elif loss == "charbonnier":
+            chroma_cast_per = (chroma ** 2 + (charbonnier_eps ** 2)).sqrt().mean(dim=1)
+            luma_cast_per = (mean_shift ** 2 + (charbonnier_eps ** 2)).sqrt().mean(dim=1)  # (B,)
+        else:  # "huber"
+            beta_target = torch.quantile(chroma.abs().float(), q=huber_beta).item()
+            chroma_cast_per = torch.nn.functional.smooth_l1_loss(
+                chroma, torch.zeros_like(chroma), beta=float(beta_target), reduction="none"
+            ).mean(dim=1)
+            beta_target = torch.quantile(mean_shift.abs().float(), q=huber_beta).item()
+            luma_cast_per = torch.nn.functional.smooth_l1_loss(
+                mean_shift, torch.zeros_like(mean_shift), beta=float(beta_target), reduction="none"
+            ).mean(dim=1)
+
+        return weight * (chroma_cast_per.mean() + luma_cast_per.mean())
 
     def get_guided_loss(
         self,
@@ -384,8 +437,10 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_pos_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
+        cc_pos_loss = self.color_cast_loss_gated(class_pred, neutral_pred)
+
         # send backward now because gradient checkpointing needs network polarity intact
-        total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss
+        total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss + cc_pos_loss
         total_pos_loss.backward()
         total_pos_loss = total_pos_loss.detach()
 
@@ -419,7 +474,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_neg_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
-        total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss
+        cc_neg_loss = self.color_cast_loss_gated(class_pred, neutral_pred)
+
+        total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss + cc_neg_loss
         total_neg_loss.backward()
         total_neg_loss = total_neg_loss.detach()
 
