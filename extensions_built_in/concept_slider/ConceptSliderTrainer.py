@@ -259,7 +259,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
             timesteps, _ = timesteps.chunk(2, dim=0)
 
         t = timesteps.to(device=pred.device, dtype=pred.dtype)
-        cc_weight = weight * (t / 1000.0).sqrt()
+        t_norm = (t / 1000.0).clamp(0, 1)
+        # 中间大两边小
+        cc_weight = weight * (1.0 - (2.0 * t_norm - 1.0).abs()) ** 2
 
         d = pred - neutral  # (B,C,H,W)
 
@@ -283,6 +285,56 @@ class ConceptSliderTrainer(DiffusionTrainer):
             raise ValueError(f"Invalid loss type: {loss_type}")
 
         return ((chroma_cast_per + luma_cast_per) * cc_weight).mean()
+
+    def get_direct_loss(
+        self,
+        noisy_latents: torch.Tensor,
+        embeds: PromptEmbeds,
+        target_class_embeds: PromptEmbeds,
+        neutral_pred: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: "DataLoaderBatchDTO",
+        anchor_target: Optional[torch.Tensor],
+        target: torch.Tensor,
+        m: float,
+    ):
+        self.network.set_multiplier(m)
+        pred = self.sd.predict_noise(
+            latents=noisy_latents,
+            conditional_embeddings=embeds,
+            timestep=timesteps,
+            guidance_scale=1.0,
+            guidance_embedding_scale=1.0,
+            batch=batch,
+        )
+
+        if self.anchor_class_embeds is not None:
+            class_pred, anchor_pred = pred.chunk(2, dim=0)
+        else:
+            class_pred = pred
+            anchor_pred = None
+
+        main_loss = torch.nn.functional.mse_loss(class_pred, target)
+
+        if anchor_target is None:
+            anchor_loss = torch.zeros_like(main_loss)
+        else:
+            anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
+
+        anchor_loss = anchor_loss * self.slider.anchor_strength
+
+        linearity_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
+
+        cc_loss = self.color_cast_loss(class_pred, neutral_pred, timesteps)
+
+        anchor_loss = self.cap_aux(anchor_loss, main_loss)
+        cc_loss = self.cap_aux(cc_loss, main_loss)
+        linearity_loss = self.cap_aux(linearity_loss, main_loss)
+        total_loss = main_loss + anchor_loss + linearity_loss + cc_loss
+        total_loss.backward()
+        total_loss = total_loss.detach()
+
+        return total_loss
 
     def get_guided_loss(
         self,
@@ -390,23 +442,23 @@ class ConceptSliderTrainer(DiffusionTrainer):
             # )
 
             positive = (positive_pred - neutral_pred) - (negative_pred - neutral_pred)
-            negative = (negative_pred - neutral_pred) - (positive_pred - neutral_pred)
+            # negative = (negative_pred - neutral_pred) - (positive_pred - neutral_pred)
 
             enhance_positive_target = neutral_pred + guidance_scale * positive
-            enhance_negative_target = neutral_pred + guidance_scale * negative
-            erase_negative_target = neutral_pred - guidance_scale * negative
+            # enhance_negative_target = neutral_pred + guidance_scale * negative
+            # erase_negative_target = neutral_pred - guidance_scale * negative
             erase_positive_target = neutral_pred - guidance_scale * positive
 
             # normalize to neutral std/mean
             enhance_positive_target = norm_like_tensor(
                 enhance_positive_target, neutral_pred
             )
-            enhance_negative_target = norm_like_tensor(
-                enhance_negative_target, neutral_pred
-            )
-            erase_negative_target = norm_like_tensor(
-                erase_negative_target, neutral_pred
-            )
+            # enhance_negative_target = norm_like_tensor(
+            #     enhance_negative_target, neutral_pred
+            # )
+            # erase_negative_target = norm_like_tensor(
+            #     erase_negative_target, neutral_pred
+            # )
             erase_positive_target = norm_like_tensor(
                 erase_positive_target, neutral_pred
             )
@@ -432,86 +484,30 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 embeds = target_class_embeds.to(self.device_torch, dtype=dtype)
 
         # do positive first
-        m = self.slider.multiplier
-        self.network.set_multiplier(m)
-        pred = self.sd.predict_noise(
-            latents=noisy_latents,
-            conditional_embeddings=embeds,
-            timestep=timesteps,
-            guidance_scale=1.0,
-            guidance_embedding_scale=1.0,
-            batch=batch,
+        total_pos_loss = self.get_direct_loss(
+            noisy_latents,
+            embeds,
+            target_class_embeds,
+            neutral_pred,
+            timesteps,
+            batch,
+            anchor_target,
+            enhance_positive_target,
+            self.slider.multiplier,
         )
-
-        if self.anchor_class_embeds is not None:
-            class_pred, anchor_pred = pred.chunk(2, dim=0)
-        else:
-            class_pred = pred
-            anchor_pred = None
-
-        # enhance positive loss
-        enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_positive_target)
-
-        # erase_loss = torch.nn.functional.mse_loss(class_pred, erase_negative_target)
-
-        if anchor_target is None:
-            anchor_loss = torch.zeros_like(enhance_loss)
-        else:
-            anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
-
-        anchor_loss = anchor_loss * self.slider.anchor_strength
-
-        linearity_pos_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
-
-        cc_pos_loss = self.color_cast_loss(class_pred, neutral_pred, timesteps)
-
-        # send backward now because gradient checkpointing needs network polarity intact
-        # 限制cc_loss不超过main_loss的10%
-        anchor_loss = self.cap_aux(anchor_loss, enhance_loss)
-        cc_pos_loss = self.cap_aux(cc_pos_loss, enhance_loss)
-        linearity_pos_loss = self.cap_aux(linearity_pos_loss, enhance_loss)
-        total_pos_loss = enhance_loss + anchor_loss + linearity_pos_loss + cc_pos_loss
-        total_pos_loss.backward()
-        total_pos_loss = total_pos_loss.detach()
 
         # now do negative
-        m = -self.slider.multiplier
-        self.network.set_multiplier(m)
-        pred = self.sd.predict_noise(
-            latents=noisy_latents,
-            conditional_embeddings=embeds,
-            timestep=timesteps,
-            guidance_scale=1.0,
-            guidance_embedding_scale=1.0,
-            batch=batch,
+        total_neg_loss = self.get_direct_loss(
+            noisy_latents,
+            embeds,
+            target_class_embeds,
+            neutral_pred,
+            timesteps,
+            batch,
+            anchor_target,
+            erase_positive_target,
+            -self.slider.multiplier,
         )
-
-        if self.anchor_class_embeds is not None:
-            class_pred, anchor_pred = pred.chunk(2, dim=0)
-        else:
-            class_pred = pred
-            anchor_pred = None
-
-        # enhance negative loss
-        # enhance_loss = torch.nn.functional.mse_loss(class_pred, enhance_negative_target)
-        erase_loss = torch.nn.functional.mse_loss(class_pred, erase_positive_target)
-
-        if anchor_target is None:
-            anchor_loss = torch.zeros_like(erase_loss)
-        else:
-            anchor_loss = torch.nn.functional.mse_loss(anchor_pred, anchor_target)
-        anchor_loss = anchor_loss * self.slider.anchor_strength
-
-        linearity_neg_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
-
-        cc_neg_loss = self.color_cast_loss(class_pred, neutral_pred, timesteps)
-
-        anchor_loss = self.cap_aux(anchor_loss, erase_loss)
-        linearity_neg_loss = self.cap_aux(linearity_neg_loss, erase_loss)
-        cc_neg_loss = self.cap_aux(cc_neg_loss, erase_loss)
-        total_neg_loss = erase_loss + anchor_loss + linearity_neg_loss + cc_neg_loss
-        total_neg_loss.backward()
-        total_neg_loss = total_neg_loss.detach()
 
         self.network.set_multiplier(1.0)
 
