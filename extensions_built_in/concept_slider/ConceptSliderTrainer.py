@@ -288,10 +288,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
         else:
             raise ValueError(f"Invalid loss type: {loss_type}")
 
-        if chroma_cast_per.abs() < gate_threshold:
-            chroma_cast_per = torch.zeros_like(chroma_cast_per)
-        if luma_cast_per.abs() < gate_threshold:
-            luma_cast_per = torch.zeros_like(luma_cast_per)
+        thr = torch.as_tensor(gate_threshold, device=chroma_cast_per.device, dtype=chroma_cast_per.dtype)
+        chroma_cast_per = torch.nn.functional.relu(chroma_cast_per - thr)
+        luma_cast_per = torch.nn.functional.relu(luma_cast_per - thr)
         return ((chroma_cast_per + luma_cast_per) * cc_weight).mean()
 
     def get_direct_loss(
