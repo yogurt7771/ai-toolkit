@@ -130,7 +130,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self,
         aux: torch.Tensor,
         main: torch.Tensor,
-        ratio: float = 0.3,
+        ratio: float = 0.1,
         main_floor: float = 1e-4,
         eps: float = 1e-5,
     ):
@@ -232,9 +232,10 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self,
         pred: torch.Tensor,
         neutral: torch.Tensor,
+        timesteps: torch.Tensor,
         *,
         weight: float = 1.0,
-        loss_type: str = "smooth_l1",      # "smooth_l1" or "mse"
+        loss_type: str = "smooth_l1",  # "smooth_l1" or "mse"
         beta: float = 0.1,
     ) -> torch.Tensor:
         """
@@ -252,6 +253,13 @@ class ConceptSliderTrainer(DiffusionTrainer):
             kW = max(1, W // max(1, down_to))
             k = min(kH, kW)
             return torch.nn.functional.avg_pool2d(d, kernel_size=k, stride=k) if k > 1 else d
+
+        if self.anchor_class_embeds is not None:
+            # 把embeds和timestemps切成两半，因为外部传入的是concatenated的
+            timesteps, _ = timesteps.chunk(2, dim=0)
+
+        t = timesteps.to(device=pred.device, dtype=pred.dtype)
+        cc_weight = weight * (t / 1000.0).sqrt()
 
         d = pred - neutral  # (B,C,H,W)
 
@@ -274,7 +282,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         else:
             raise ValueError(f"Invalid loss type: {loss_type}")
 
-        return weight * (chroma_cast_per.mean() + luma_cast_per.mean())
+        return ((chroma_cast_per + luma_cast_per) * cc_weight).mean()
 
     def get_guided_loss(
         self,
@@ -455,7 +463,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_pos_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
-        cc_pos_loss = self.color_cast_loss(class_pred, neutral_pred)
+        cc_pos_loss = self.color_cast_loss(class_pred, neutral_pred, timesteps)
 
         # send backward now because gradient checkpointing needs network polarity intact
         # 限制cc_loss不超过main_loss的10%
@@ -498,7 +506,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_neg_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
-        cc_neg_loss = self.color_cast_loss(class_pred, neutral_pred)
+        cc_neg_loss = self.color_cast_loss(class_pred, neutral_pred, timesteps)
 
         anchor_loss = self.cap_aux(anchor_loss, erase_loss)
         linearity_neg_loss = self.cap_aux(linearity_neg_loss, erase_loss)
