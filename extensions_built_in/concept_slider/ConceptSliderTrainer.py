@@ -25,13 +25,13 @@ class ConceptSliderTrainerConfig:
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Normalize the tensor to have the same mean and std as the target tensor."""
-    tensor_mean = tensor.flatten(start_dim=1).mean(dim=1)
-    tensor_std = tensor.flatten(start_dim=1).std(dim=1)
-    target_mean = target.flatten(start_dim=1).mean(dim=1)
-    target_std = target.flatten(start_dim=1).std(dim=1)
+    tensor_mean = tensor.mean(dim=(1, 2, 3), keepdim=True)
+    tensor_std = tensor.std(dim=(1, 2, 3), keepdim=True)
+    target_mean = target.mean(dim=(1, 2, 3), keepdim=True)
+    target_std = target.std(dim=(1, 2, 3), keepdim=True)
     normalized_tensor = (tensor - tensor_mean) / (
         tensor_std + 1e-8
-    ) * target_std + target_mean
+    ) * target_std + tensor_mean
     return normalized_tensor
 
 
@@ -474,8 +474,6 @@ class ConceptSliderTrainer(DiffusionTrainer):
         total_pos_loss.backward()
         total_pos_loss = total_pos_loss.detach()
 
-        print(f"\npos - enhance_loss: {enhance_loss.item()}, anchor_loss: {anchor_loss.item()}, linearity_pos_loss: {linearity_pos_loss.item()}, cc_pos_loss: {cc_pos_loss.item()}, total_pos_loss: {total_pos_loss.item()}")
-
         # now do negative
         m = -self.slider.multiplier
         self.network.set_multiplier(m)
@@ -514,8 +512,6 @@ class ConceptSliderTrainer(DiffusionTrainer):
         total_neg_loss = erase_loss + anchor_loss + linearity_neg_loss + cc_neg_loss
         total_neg_loss.backward()
         total_neg_loss = total_neg_loss.detach()
-
-        print(f"\nneg - erase_loss: {erase_loss.item()}, anchor_loss: {anchor_loss.item()}, linearity_neg_loss: {linearity_neg_loss.item()}, cc_neg_loss: {cc_neg_loss.item()}, total_neg_loss: {total_neg_loss.item()}")
 
         self.network.set_multiplier(1.0)
 
