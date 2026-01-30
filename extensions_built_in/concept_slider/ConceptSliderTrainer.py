@@ -25,10 +25,10 @@ class ConceptSliderTrainerConfig:
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Normalize the tensor to have the same mean and std as the target tensor."""
-    tensor_mean = tensor.mean()
-    tensor_std = tensor.std()
-    target_mean = target.mean()
-    target_std = target.std()
+    tensor_mean = tensor.flatten(start_dim=1).mean(dim=1)
+    tensor_std = tensor.flatten(start_dim=1).std(dim=1)
+    target_mean = target.flatten(start_dim=1).mean(dim=1)
+    target_std = target.flatten(start_dim=1).std(dim=1)
     normalized_tensor = (tensor - tensor_mean) / (
         tensor_std + 1e-8
     ) * target_std + target_mean
