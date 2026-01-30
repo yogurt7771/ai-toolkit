@@ -31,7 +31,7 @@ def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     target_std = target.std(dim=(1, 2, 3), keepdim=True)
     normalized_tensor = (tensor - tensor_mean) / (
         tensor_std + 1e-8
-    ) * target_std + tensor_mean
+    ) * target_std + target_mean
     return normalized_tensor
 
 
