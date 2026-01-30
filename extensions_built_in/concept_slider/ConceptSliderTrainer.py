@@ -160,6 +160,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         weight: float = 1.0,
         delta: float = 0.1,
         loss_type: str = "smooth_l1",
+        gate_threshold: float = 0.005,
         beta: float = 0.1,
     ) -> torch.Tensor:
         was_unet_training = self.sd.unet.training
@@ -226,6 +227,8 @@ class ConceptSliderTrainer(DiffusionTrainer):
             linearity_loss = self.smooth_l1_tensor_beta(diff, beta).flatten(start_dim=1).mean(dim=1)
         else:
             raise ValueError(f"Invalid loss type: {loss_type}")
+        if linearity_loss.abs() < gate_threshold:
+            return torch.zeros_like(linearity_loss)
         return (linearity_loss * linearity_weight).mean()
 
     def color_cast_loss(
@@ -237,6 +240,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         weight: float = 1.0,
         loss_type: str = "smooth_l1",  # "smooth_l1" or "mse"
         beta: float = 0.1,
+        gate_threshold: float = 0.005,
     ) -> torch.Tensor:
         """
         仅低频抑制的“色彩偏移”惩罚（pred 域）。
@@ -284,6 +288,10 @@ class ConceptSliderTrainer(DiffusionTrainer):
         else:
             raise ValueError(f"Invalid loss type: {loss_type}")
 
+        if chroma_cast_per.abs() < gate_threshold:
+            chroma_cast_per = torch.zeros_like(chroma_cast_per)
+        if luma_cast_per.abs() < gate_threshold:
+            luma_cast_per = torch.zeros_like(luma_cast_per)
         return ((chroma_cast_per + luma_cast_per) * cc_weight).mean()
 
     def get_direct_loss(
