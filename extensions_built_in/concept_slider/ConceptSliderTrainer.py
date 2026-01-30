@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from typing import Optional
+from copy import deepcopy
 
 import torch
 
@@ -16,13 +17,10 @@ class ConceptSliderTrainerConfig:
         self.positive_prompt: str = kwargs.get("positive_prompt", "")
         self.negative_prompt: str = kwargs.get("negative_prompt", "")
         self.neutral_prompt: str = kwargs.get("neutral_prompt", "")
-        self.target_classes: list[str] = kwargs.get("target_class", [])
+        self.target_class: str = kwargs.get("target_class", "")
+        self.target_classes: list[str] = kwargs.get("target_classes", [])
         self.anchor_class: Optional[str] = kwargs.get("anchor_class", None)
         self.multiplier: float = float(kwargs.get("multiplier", 1.0))
-        self.linearity_weight: float = float(kwargs.get("linearity_weight", 0.1))
-        self.linearity_delta: float = float(kwargs.get("linearity_delta", 0.1))
-        self.linearity_loss_type: str = str(kwargs.get("linearity_loss_type", "smooth_l1"))
-        self.linearity_huber_beta: float = float(kwargs.get("linearity_huber_beta", 0.1))
 
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -58,6 +56,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 ConceptSliderTrainerConfig(**slider_raw)
             ]
 
+        self.flat_sliders: list[ConceptSliderTrainerConfig] = []
         # 兼容旧代码路径：保留 self.slider 指向第一个 slider
         self.slider: ConceptSliderTrainerConfig = self.sliders[0]
 
@@ -73,40 +72,48 @@ class ConceptSliderTrainer(DiffusionTrainer):
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
             self.slider_prompt_embeds = []
+            self.flat_sliders = []
             for s in self.sliders:
                 for target_class in s.target_classes:
+                    new_slider = deepcopy(s)
+                    new_slider.target_class = target_class
+                    new_slider.positive_prompt = new_slider.positive_prompt.replace("[target]", target_class)
+                    new_slider.neutral_prompt = new_slider.neutral_prompt.replace("[target]", target_class) if new_slider.neutral_prompt is not None else target_class
+                    new_slider.negative_prompt = new_slider.negative_prompt.replace("[target]", target_class)
+                    new_slider.anchor_class = new_slider.anchor_class.replace("[target]", target_class) if new_slider.anchor_class is not None else None
+                    self.flat_sliders.append(new_slider)
+
                     positive_prompt_embeds = (
-                        self.sd.encode_prompt([s.positive_prompt.replace("[target]", target_class)])
+                        self.sd.encode_prompt([new_slider.positive_prompt])
                         .to(self.device_torch, dtype=self.sd.torch_dtype)
                         .detach()
                     )
 
                     target_class_embeds = (
-                        self.sd.encode_prompt([target_class])
+                        self.sd.encode_prompt([new_slider.target_class])
                         .to(self.device_torch, dtype=self.sd.torch_dtype)
                         .detach()
                     )
 
                     neutral_prompt_embeds = (
-                        self.sd.encode_prompt([s.neutral_prompt.replace("[target]", target_class) if s.neutral_prompt is not None else target_class])
+                        self.sd.encode_prompt([new_slider.neutral_prompt])
                         .to(self.device_torch, dtype=self.sd.torch_dtype)
                         .detach()
                     )
 
                     negative_prompt_embeds = (
-                        self.sd.encode_prompt([s.negative_prompt.replace("[target]", target_class)])
+                        self.sd.encode_prompt([new_slider.negative_prompt])
                         .to(self.device_torch, dtype=self.sd.torch_dtype)
                         .detach()
                     )
 
                     anchor_class_embeds: Optional[PromptEmbeds] = None
-                    if s.anchor_class is not None:
+                    if new_slider.anchor_class is not None:
                         anchor_class_embeds = (
-                            self.sd.encode_prompt([s.anchor_class.replace("[target]", target_class)])
+                            self.sd.encode_prompt([new_slider.anchor_class])
                             .to(self.device_torch, dtype=self.sd.torch_dtype)
                             .detach()
                         )
-
                     self.slider_prompt_embeds.append(
                         {
                             "positive": positive_prompt_embeds,
@@ -116,9 +123,30 @@ class ConceptSliderTrainer(DiffusionTrainer):
                             "anchor": anchor_class_embeds,
                         }
                     )
-
         # call parent
         super().hook_before_train_loop()
+
+    def cap_aux(
+        self,
+        aux: torch.Tensor,
+        main: torch.Tensor,
+        ratio: float = 0.3,
+        main_floor: float = 1e-4,
+        eps: float = 1e-5,
+    ):
+        with torch.no_grad():
+            m = main.detach().clamp_min(main_floor)
+            a = aux.detach()
+            lam = (m * ratio) / (a + eps)
+            lam = lam.clamp(0.0, 1.0)
+        return aux * lam.detach()
+
+    def smooth_l1_tensor_beta(self, x: torch.Tensor, beta: float, eps: float = 1e-5):
+        absx = x.abs()
+        beta_target = torch.quantile(absx.detach().float(), q=beta).clamp_min(eps)
+        return torch.where(
+            absx < beta_target, 0.5 * (absx**2) / beta_target, absx - 0.5 * beta_target
+        )
 
     def get_linearity_loss(
         self,
@@ -128,6 +156,11 @@ class ConceptSliderTrainer(DiffusionTrainer):
         batch,
         class_pred: torch.Tensor,
         m,
+        *,
+        weight: float = 1.0,
+        delta: float = 0.1,
+        loss_type: str = "smooth_l1",
+        beta: float = 0.1,
     ) -> torch.Tensor:
         was_unet_training = self.sd.unet.training
         old_m = self.network.multiplier
@@ -138,11 +171,11 @@ class ConceptSliderTrainer(DiffusionTrainer):
             noisy_latents, _ = noisy_latents.chunk(2, dim=0)
 
         t = timesteps.to(device=class_pred.device, dtype=class_pred.dtype)
-        linearity_weight = self.slider.linearity_weight * (t / 1000.0) ** 2
+        linearity_weight = weight * (t / 1000.0) ** 2
         with torch.no_grad():
             # do left pred
             self.sd.unet.eval()
-            self.network.set_multiplier(m - self.slider.linearity_delta)
+            self.network.set_multiplier(m - delta)
             pred = self.sd.predict_noise(
                 latents=noisy_latents,
                 conditional_embeddings=embeds,
@@ -154,7 +187,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
             class_pred_left = pred
 
             # do right pred
-            self.network.set_multiplier(m + self.slider.linearity_delta)
+            self.network.set_multiplier(m + delta)
             pred = self.sd.predict_noise(
                 latents=noisy_latents,
                 conditional_embeddings=embeds,
@@ -171,51 +204,41 @@ class ConceptSliderTrainer(DiffusionTrainer):
         # restore network multiplier
         self.network.set_multiplier(old_m)
 
-        linearity_mid = (class_pred_left + class_pred_right) / 2.0
+        linearity_mid = (class_pred_left + class_pred_right)
+        pred = class_pred * 2
 
-        if self.slider.linearity_loss_type == "mae":
+        if loss_type == "mae":
             linearity_loss = (
-                torch.nn.functional.l1_loss(class_pred, linearity_mid, reduction="none")
+                torch.nn.functional.l1_loss(pred, linearity_mid, reduction="none")
                 .flatten(start_dim=1)
                 .mean(dim=1)
             )
             linearity_loss = (linearity_loss * linearity_weight).mean()
-        elif self.slider.linearity_loss_type == "mse":
+        elif type == "mse":
             linearity_loss = (
                 torch.nn.functional.mse_loss(
-                    class_pred, linearity_mid, reduction="none"
+                    pred, linearity_mid, reduction="none"
                 )
                 .flatten(start_dim=1)
                 .mean(dim=1)
             )
             linearity_loss = (linearity_loss * linearity_weight).mean()
-        elif self.slider.linearity_loss_type == "smooth_l1":
-            with torch.no_grad():
-                abs_e = (class_pred.detach() - linearity_mid).abs().flatten().float()
-                beta_target = torch.quantile(abs_e, q=self.slider.linearity_huber_beta).item()
-
-            linearity_loss = (
-                torch.nn.functional.smooth_l1_loss(
-                    class_pred, linearity_mid, beta=float(beta_target), reduction="none"
-                )
-                .flatten(start_dim=1)
-                .mean(dim=1)
-            )
+        elif type == "smooth_l1":
+            diff = pred - linearity_mid
+            linearity_loss = self.smooth_l1_tensor_beta(diff, beta).flatten(start_dim=1).mean(dim=1)
             linearity_loss = (linearity_loss * linearity_weight).mean()
         else:
             linearity_loss = torch.zeros((), device=class_pred.device, dtype=class_pred.dtype)
         return linearity_loss
 
-    def color_cast_loss_gated(
+    def color_cast_loss(
         self,
-        pred_a: torch.Tensor,
-        pred_b: torch.Tensor,
+        pred: torch.Tensor,
+        neutral: torch.Tensor,
         *,
-        kernel_size: int = 3,
         weight: float = 1.0,
-        loss: str = "huber",      # "huber" or "charbonnier" or "mse"
-        huber_beta: float = 0.1,
-        charbonnier_eps: float = 1e-3,
+        loss_type: str = "smooth_l1",      # "smooth_l1" or "mse"
+        beta: float = 0.1,
     ) -> torch.Tensor:
         """
         仅低频抑制的“色彩偏移”惩罚（pred 域）。
@@ -226,35 +249,31 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         pred_a/pred_b: (B,C,H,W)
         """
-        if pred_a.shape != pred_b.shape:
-            raise ValueError(f"Shape mismatch: {pred_a.shape} vs {pred_b.shape}")
-        if pred_a.ndim != 4:
-            raise ValueError(f"Expected (B,C,H,W), got {pred_a.shape}")
+        def lowpass_to(d: torch.Tensor, down_to: int = 8):
+            B, C, H, W = d.shape
+            kH = max(1, H // max(1, down_to))
+            kW = max(1, W // max(1, down_to))
+            k = min(kH, kW)
+            return torch.nn.functional.avg_pool2d(d, kernel_size=k, stride=k) if k > 1 else d
 
-        d = pred_a - pred_b  # (B,C,H,W)
+        d = pred - neutral  # (B,C,H,W)
 
-        d_lp = torch.nn.functional.avg_pool2d(d, kernel_size=kernel_size, stride=(kernel_size + 1) // 2)
+        d_lp = lowpass_to(d)
 
         # --- chroma mean shift (remove luminance component) ---
-        mean_shift = d_lp.mean(dim=(2, 3))                       # (B,C)
-        chroma = mean_shift - mean_shift.mean(dim=1, keepdim=True)  # (B,C)
+        mean_shift = d_lp.mean(dim=(2, 3))
+        luminance_shift = mean_shift.mean(dim=1, keepdim=True)
+        chroma_shift = mean_shift - luminance_shift
 
         # --- smooth penalty ---
-        if loss == "mse":
-            chroma_cast_per = (chroma ** 2).mean(dim=1)  # (B,)
-            luma_cast_per = (mean_shift ** 2).mean(dim=1)  # (B,)
-        elif loss == "charbonnier":
-            chroma_cast_per = (chroma ** 2 + (charbonnier_eps ** 2)).sqrt().mean(dim=1)
-            luma_cast_per = (mean_shift ** 2 + (charbonnier_eps ** 2)).sqrt().mean(dim=1)  # (B,)
-        else:  # "huber"
-            beta_target = torch.quantile(chroma.abs().float(), q=huber_beta).item()
-            chroma_cast_per = torch.nn.functional.smooth_l1_loss(
-                chroma, torch.zeros_like(chroma), beta=float(beta_target), reduction="none"
-            ).mean(dim=1)
-            beta_target = torch.quantile(mean_shift.abs().float(), q=huber_beta).item()
-            luma_cast_per = torch.nn.functional.smooth_l1_loss(
-                mean_shift, torch.zeros_like(mean_shift), beta=float(beta_target), reduction="none"
-            ).mean(dim=1)
+        if loss_type == "mse":
+            chroma_cast_per = (chroma_shift ** 2).mean(dim=1)
+            luma_cast_per = (luminance_shift ** 2).mean(dim=1)
+        elif loss_type == "smooth_l1":
+            chroma_cast_per = self.smooth_l1_tensor_beta(chroma_shift, beta).mean(dim=1)
+            luma_cast_per = self.smooth_l1_tensor_beta(luminance_shift, beta).mean(dim=1)
+        else:
+            raise ValueError(f"Invalid loss type: {loss_type}")
 
         return weight * (chroma_cast_per.mean() + luma_cast_per.mean())
 
@@ -278,9 +297,9 @@ class ConceptSliderTrainer(DiffusionTrainer):
             was_network_active = self.network.is_active
             self.network.is_active = False
 
-        num_sliders = max(1, len(self.sliders))
+        num_sliders = max(1, len(self.flat_sliders))
         slider_idx = torch.randint(0, num_sliders, (1,)).item()
-        self.slider = self.sliders[slider_idx]
+        self.slider = self.flat_sliders[slider_idx]
         self.positive_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("positive")
         self.target_class_embeds = self.slider_prompt_embeds[slider_idx].get("target")
         self.negative_prompt_embeds = self.slider_prompt_embeds[slider_idx].get("negative")
@@ -437,12 +456,18 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_pos_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
-        cc_pos_loss = self.color_cast_loss_gated(class_pred, neutral_pred)
+        cc_pos_loss = self.color_cast_loss(class_pred, neutral_pred)
 
         # send backward now because gradient checkpointing needs network polarity intact
-        total_pos_loss = (enhance_loss + anchor_loss) / 2.0 + linearity_pos_loss + cc_pos_loss
+        # 限制cc_loss不超过main_loss的10%
+        anchor_loss = self.cap_aux(anchor_loss, enhance_loss)
+        cc_pos_loss = self.cap_aux(cc_pos_loss, enhance_loss)
+        linearity_pos_loss = self.cap_aux(linearity_pos_loss, enhance_loss)
+        total_pos_loss = enhance_loss + anchor_loss + linearity_pos_loss + cc_pos_loss
         total_pos_loss.backward()
         total_pos_loss = total_pos_loss.detach()
+
+        print(f"\npos - enhance_loss: {enhance_loss.item()}, anchor_loss: {anchor_loss.item()}, linearity_pos_loss: {linearity_pos_loss.item()}, cc_pos_loss: {cc_pos_loss.item()}, total_pos_loss: {total_pos_loss.item()}")
 
         # now do negative
         m = -self.slider.multiplier
@@ -474,11 +499,16 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
         linearity_neg_loss = self.get_linearity_loss(noisy_latents, target_class_embeds, timesteps, batch, class_pred, m)
 
-        cc_neg_loss = self.color_cast_loss_gated(class_pred, neutral_pred)
+        cc_neg_loss = self.color_cast_loss(class_pred, neutral_pred)
 
-        total_neg_loss = (erase_loss + anchor_loss) / 2.0 + linearity_neg_loss + cc_neg_loss
+        anchor_loss = self.cap_aux(anchor_loss, erase_loss)
+        linearity_neg_loss = self.cap_aux(linearity_neg_loss, erase_loss)
+        cc_neg_loss = self.cap_aux(cc_neg_loss, erase_loss)
+        total_neg_loss = erase_loss + anchor_loss + linearity_neg_loss + cc_neg_loss
         total_neg_loss.backward()
         total_neg_loss = total_neg_loss.detach()
+
+        print(f"\nneg - erase_loss: {erase_loss.item()}, anchor_loss: {anchor_loss.item()}, linearity_neg_loss: {linearity_neg_loss.item()}, cc_neg_loss: {cc_neg_loss.item()}, total_neg_loss: {total_neg_loss.item()}")
 
         self.network.set_multiplier(1.0)
 
