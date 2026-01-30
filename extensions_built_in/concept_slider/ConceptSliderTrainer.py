@@ -130,7 +130,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self,
         aux: torch.Tensor,
         main: torch.Tensor,
-        ratio: float = 0.1,
+        ratio: float = 0.2,
         main_floor: float = 1e-4,
         eps: float = 1e-5,
     ):
