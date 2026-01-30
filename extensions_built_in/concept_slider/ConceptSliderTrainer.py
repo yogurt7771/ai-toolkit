@@ -213,8 +213,7 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 .flatten(start_dim=1)
                 .mean(dim=1)
             )
-            linearity_loss = (linearity_loss * linearity_weight).mean()
-        elif type == "mse":
+        elif loss_type == "mse":
             linearity_loss = (
                 torch.nn.functional.mse_loss(
                     pred, linearity_mid, reduction="none"
@@ -222,14 +221,12 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 .flatten(start_dim=1)
                 .mean(dim=1)
             )
-            linearity_loss = (linearity_loss * linearity_weight).mean()
-        elif type == "smooth_l1":
+        elif loss_type == "smooth_l1":
             diff = pred - linearity_mid
             linearity_loss = self.smooth_l1_tensor_beta(diff, beta).flatten(start_dim=1).mean(dim=1)
-            linearity_loss = (linearity_loss * linearity_weight).mean()
         else:
-            linearity_loss = torch.zeros((), device=class_pred.device, dtype=class_pred.dtype)
-        return linearity_loss
+            raise ValueError(f"Invalid loss type: {loss_type}")
+        return (linearity_loss * linearity_weight).mean()
 
     def color_cast_loss(
         self,
@@ -265,8 +262,10 @@ class ConceptSliderTrainer(DiffusionTrainer):
         luminance_shift = mean_shift.mean(dim=1, keepdim=True)
         chroma_shift = mean_shift - luminance_shift
 
-        # --- smooth penalty ---
-        if loss_type == "mse":
+        if loss_type == "mae":
+            chroma_cast_per = (chroma_shift.abs()).mean(dim=1)
+            luma_cast_per = (luminance_shift.abs()).mean(dim=1)
+        elif loss_type == "mse":
             chroma_cast_per = (chroma_shift ** 2).mean(dim=1)
             luma_cast_per = (luminance_shift ** 2).mean(dim=1)
         elif loss_type == "smooth_l1":
