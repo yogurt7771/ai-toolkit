@@ -196,6 +196,60 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             return self.sd.noise_scheduler.get_velocity(batch.latents, noise, timesteps).detach()
         return noise.detach()
 
+    def get_keep_loss(
+        self,
+        noisy_latents: torch.Tensor,
+        conditional_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+        pred_kwargs: dict,
+        class_pred: torch.Tensor,
+        mc: torch.Tensor,
+        eps: float = 1e-6,
+    ):
+        was_unet_training = self.sd.unet.training
+        was_network_active = False
+        if self.network is not None:
+            was_network_active = self.network.is_active
+            self.network.is_active = False
+
+        self.sd.unet.eval()
+        with torch.no_grad():
+            pred_baseline = self.sd.predict_noise(
+                latents=noisy_latents.to(self.device_torch, dtype=self.sd.torch_dtype).detach(),
+                conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=self.sd.torch_dtype).detach(),
+                timestep=timesteps,
+                guidance_scale=1.0,
+                guidance_embedding_scale=1.0,
+                batch=batch,
+                **pred_kwargs,
+            ).detach()
+        if was_unet_training:
+            self.sd.unet.train()
+        if self.network is not None:
+            self.network.is_active = was_network_active
+
+        inv = 1.0 - mc
+        err_keep = (class_pred - pred_baseline) ** 2
+
+        keep_sum = (err_keep * inv).sum(dim=[1,2,3])
+        keep_den = inv.sum(dim=[1,2,3]).clamp_min(eps)
+        keep_mean = keep_sum / keep_den
+        return keep_mean
+
+    def get_edit_loss(
+        self,
+        target: torch.Tensor,
+        class_pred: torch.Tensor,
+        mc: torch.Tensor,
+        eps: float = 1e-6,
+    ):
+        err = (class_pred - target) ** 2
+        edit_sum = (err * mc).sum(dim=[1,2,3])
+        edit_den = mc.sum(dim=[1,2,3]).clamp_min(eps)
+        edit_mean = edit_sum / edit_den
+        return edit_mean
+
     def get_direct_loss(
         self,
         noisy_latents: torch.Tensor,
@@ -224,11 +278,35 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
         )
         if loss_mask is not None:
             m = loss_mask.to(device=pred.device, dtype=pred.dtype)
-            w = 1.0 + 10.0 * m
         else:
-            w = 1.0
-        loss_main = ((pred - target) ** 2) * w
-        loss_main_per = loss_main.flatten(start_dim=1).mean(dim=1)
+            m = torch.ones(
+                (pred.shape[0], 1, pred.shape[2], pred.shape[3]),
+                device=pred.device,
+                dtype=pred.dtype,
+            )
+        tau = 0.1
+        m = ((m - tau) / (1.0 - tau + 1e-6)).clamp(0.0, 1.0)  # (B,1,H,W)
+        mc = m.expand(-1, pred.shape[1], -1, -1)
+
+        edit_loss_per = self.get_edit_loss(
+            target=target,
+            class_pred=pred,
+            mc=mc,
+        )
+
+        keep_loss_per = self.get_keep_loss(
+            noisy_latents=noisy_latents,
+            conditional_embeds=conditional_embeds,
+            timesteps=timesteps,
+            batch=batch,
+            pred_kwargs=pred_kwargs,
+            class_pred=pred,
+            mc=mc,
+        )
+
+        keep_cap_per = self.cap_aux(keep_loss_per, edit_loss_per, ratio=0.5, main_floor=self.slider_config.cap_main_floor, eps=self.slider_config.cap_eps)
+
+        loss_main_per = edit_loss_per + keep_loss_per
         loss_main = loss_main_per.mean()
 
         linearity_loss_per = self.get_linearity_loss(
