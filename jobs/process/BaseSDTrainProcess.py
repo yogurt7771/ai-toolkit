@@ -2366,6 +2366,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:
+            self.save(self.step_num)
             self.save()
             self.logger.finish()
         self.accelerator.end_training()

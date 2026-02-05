@@ -2911,10 +2911,13 @@ class StableDiffusion:
                 'requires_grad': unet_has_grad,
             },
         }
+        from toolkit.unloader import FakeTextEncoder
         if isinstance(self.text_encoder, list):
             self.device_state['text_encoder']: List[dict] = []
             for encoder in self.text_encoder:
-                if isinstance(encoder, LlamaModel):
+                if isinstance(encoder, FakeTextEncoder):
+                    te_has_grad = False
+                elif isinstance(encoder, LlamaModel):
                     te_has_grad = encoder.layers[0].mlp.gate_proj.weight.requires_grad
                 else:
                     try:
@@ -2936,6 +2939,8 @@ class StableDiffusion:
                 te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad
             elif isinstance(self.text_encoder, LlamaModel):
                 te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad
+            elif isinstance(encoder, FakeTextEncoder):
+                te_has_grad = False
             else:
                 te_has_grad = self.text_encoder.text_model.final_layer_norm.weight.requires_grad
 
