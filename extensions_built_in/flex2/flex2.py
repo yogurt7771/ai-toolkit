@@ -356,6 +356,11 @@ class Flex2(BaseModel):
 
     def get_te_has_grad(self):
         # return from a weight if it has grad
+        from toolkit.unloader import FakeTextEncoder
+
+        te = self.text_encoder[1]
+        if isinstance(te, FakeTextEncoder):
+            return False
         return self.text_encoder[1].encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
     
     def save_model(self, output_path, meta, save_dtype):

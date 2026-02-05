@@ -1,3 +1,4 @@
+import sdpa_patch  # noqa: F401
 import os
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"

@@ -34,6 +34,26 @@ TEXT_ENCODER_2_PROJECTION_DIM = 1280
 UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 
 
+def _module_device(module: torch.nn.Module) -> torch.device:
+    if hasattr(module, "device") and module.device is not None:
+        return torch.device(module.device)
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
+
+
+def _module_dtype(module: torch.nn.Module) -> torch.dtype:
+    if hasattr(module, "dtype") and module.dtype is not None:
+        return module.dtype
+    for parameter in module.parameters():
+        return parameter.dtype
+    for buffer in module.buffers():
+        return buffer.dtype
+    return torch.float32
+
+
 def get_torch_dtype(dtype_str):
     # if it is a torch dtype, return it
     if isinstance(dtype_str, torch.dtype):
@@ -525,10 +545,10 @@ def encode_prompts_flux(
             prompt if torch.rand(1).item() > dropout_prob else "" for prompt in prompts
         ]
 
-    device = text_encoder[0].device
-    dtype = text_encoder[0].dtype
-
-    batch_size = len(prompts)
+    clip_device = _module_device(text_encoder[0])
+    clip_dtype = _module_dtype(text_encoder[0])
+    t5_device = _module_device(text_encoder[1])
+    t5_dtype = _module_dtype(text_encoder[1])
 
     # clip
     text_inputs = tokenizer[0](
@@ -543,11 +563,14 @@ def encode_prompts_flux(
 
     text_input_ids = text_inputs.input_ids
 
-    prompt_embeds = text_encoder[0](text_input_ids.to(device), output_hidden_states=False)
+    prompt_embeds = text_encoder[0](
+        text_input_ids.to(clip_device),
+        output_hidden_states=False,
+    )
 
     # Use pooled output of CLIPTextModel
     pooled_prompt_embeds = prompt_embeds.pooler_output
-    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=dtype, device=device)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=clip_dtype, device=clip_device)
 
     # T5
     text_inputs = tokenizer[1](
@@ -561,10 +584,11 @@ def encode_prompts_flux(
     )
     text_input_ids = text_inputs.input_ids
 
-    prompt_embeds = text_encoder[1](text_input_ids.to(device), output_hidden_states=False)[0]
-
-    dtype = text_encoder[1].dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_embeds = text_encoder[1](
+        text_input_ids.to(t5_device),
+        output_hidden_states=False,
+    )[0]
+    prompt_embeds = prompt_embeds.to(dtype=t5_dtype, device=clip_device)
 
     if attn_mask:
         prompt_attention_mask = text_inputs["attention_mask"].unsqueeze(-1).expand(prompt_embeds.shape)

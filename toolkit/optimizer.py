@@ -83,6 +83,13 @@ def get_optimizer(
             return Lion(params, lr=learning_rate, **optimizer_params)
         except ImportError:
             raise ImportError("Please install lion_pytorch to use Lion optimizer -> pip install lion-pytorch")
+    elif lower_type == 'muon':
+        if not hasattr(torch.optim, "Muon"):
+            raise ImportError(
+                "Muon optimizer requires a PyTorch version that provides torch.optim.Muon (e.g. >= 2.8). "
+                "Please upgrade torch to use this optimizer."
+            )
+        optimizer = torch.optim.Muon(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'adagrad':
         optimizer = torch.optim.Adagrad(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'adafactor':

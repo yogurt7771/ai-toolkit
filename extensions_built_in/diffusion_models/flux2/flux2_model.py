@@ -391,9 +391,13 @@ class Flux2Model(BaseModel):
                         control_img = control_img * 2 - 1
                         controls.append(control_img)
 
+                    vae_device = next(self.vae.parameters()).device
+                    if vae_device != self.device_torch:
+                        self.vae = self.vae.to(self.device_torch)
                     img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
                         self.vae, controls, limit_pixels=control_image_max_res
                     )
+                    self.vae = self.vae.to(vae_device)
                     if img_cond_seq is None:
                         img_cond_seq = img_cond_seq_item
                         img_cond_seq_ids = img_cond_seq_ids_item

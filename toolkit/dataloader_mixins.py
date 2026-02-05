@@ -755,6 +755,8 @@ class ImageProcessingDTOMixin:
         if self.use_alpha_as_mask:
             # we do this to make sure it does not replace the alpha with another color
             # we want the image just without the alpha channel
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
             np_img = np.array(img)
             # strip off alpha
             np_img = np_img[:, :, :3]
@@ -1406,7 +1408,10 @@ class MaskFileItemDTOMixin:
         if self.use_alpha_as_mask:
             # pipeline expectws an rgb image so we need to put alpha in all channels
             np_img = np.array(img)
-            np_img[:, :, :3] = np_img[:, :, 3:]
+            if np_img.shape[2] == 4:
+                np_img[:, :, :3] = np_img[:, :, 3:]
+            else:
+                np_img[:, :, :3] = 255  # there is no alpha channel, make it all white
 
             np_img = np_img[:, :, :3]
             img = Image.fromarray(np_img)
