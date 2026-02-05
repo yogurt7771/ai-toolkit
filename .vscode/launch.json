@@ -3,7 +3,7 @@
     "configurations": [
         {
             "name": "Run current config",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -18,7 +18,7 @@
         },
         {
             "name": "Run current config (cuda:1)",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/run.py",
             "args": [
@@ -34,7 +34,7 @@
         },
         {
             "name": "Python: Debug Current File",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
@@ -42,7 +42,7 @@
         },
         {
             "name": "Python: Debug Current File (cuda:1)",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",

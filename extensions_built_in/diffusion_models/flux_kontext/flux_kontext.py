@@ -18,6 +18,7 @@ from toolkit.accelerator import get_accelerator, unwrap_model
 from optimum.quanto import freeze, QTensor
 from toolkit.util.mask import generate_random_mask, random_dialate_mask
 from toolkit.util.quantize import quantize, get_qtype
+from toolkit.memory_management.manager import MemoryManager
 from transformers import T5TokenizerFast, T5EncoderModel, CLIPTextModel, CLIPTokenizer
 from einops import rearrange, repeat
 import random
@@ -113,6 +114,16 @@ class FluxKontextModel(BaseModel):
 
         flush()
 
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_transformer_percent > 0
+        ):
+            MemoryManager.attach(
+                transformer,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_transformer_percent,
+            )
+
         self.print_and_status_update("Loading T5")
         tokenizer_2 = T5TokenizerFast.from_pretrained(
             base_model_path, subfolder="tokenizer_2", torch_dtype=dtype
@@ -130,12 +141,32 @@ class FluxKontextModel(BaseModel):
             freeze(text_encoder_2)
             flush()
 
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_text_encoder_percent > 0
+        ):
+            MemoryManager.attach(
+                text_encoder_2,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+            )
+
         self.print_and_status_update("Loading CLIP")
         text_encoder = CLIPTextModel.from_pretrained(
             base_model_path, subfolder="text_encoder", torch_dtype=dtype)
         tokenizer = CLIPTokenizer.from_pretrained(
             base_model_path, subfolder="tokenizer", torch_dtype=dtype)
         text_encoder.to(self.device_torch, dtype=dtype)
+
+        if (
+            self.model_config.layer_offloading
+            and self.model_config.layer_offloading_text_encoder_percent > 0
+        ):
+            MemoryManager.attach(
+                text_encoder,
+                self.device_torch,
+                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
+            )
 
         self.print_and_status_update("Loading VAE")
         vae = AutoencoderKL.from_pretrained(
@@ -211,9 +242,12 @@ class FluxKontextModel(BaseModel):
         extra: dict,
     ):
         if gen_config.ctrl_img is None:
-            raise ValueError(
-                "Control image is required for Flux Kontext model generation."
-            )
+            # raise ValueError(
+            #     "Control image is required for Flux Kontext model generation."
+            # )
+            import warnings
+            warnings.warn("Control image is not provided for Flux Kontext model generation.")
+            control_img = None
         else:
             control_img = Image.open(gen_config.ctrl_img)
             control_img = control_img.convert("RGB")
@@ -372,6 +406,10 @@ class FluxKontextModel(BaseModel):
 
     def get_te_has_grad(self):
         # return from a weight if it has grad
+        from toolkit.unloader import FakeTextEncoder
+        te = self.text_encoder[1]
+        if isinstance(te, FakeTextEncoder):
+            return False
         return self.text_encoder[1].encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
     
     def save_model(self, output_path, meta, save_dtype):
@@ -395,7 +433,9 @@ class FluxKontextModel(BaseModel):
         with torch.no_grad():
             control_tensor = batch.control_tensor
             if control_tensor is not None:
-                self.vae.to(self.device_torch)
+                vae_device = next(self.vae.parameters()).device
+                if vae_device != self.device_torch:
+                    self.vae = self.vae.to(self.device_torch)
                 # we are not packed here, so we just need to pass them so we can pack them later
                 control_tensor = control_tensor * 2 - 1
                 control_tensor = control_tensor.to(self.vae_device_torch, dtype=self.torch_dtype)
@@ -413,6 +453,8 @@ class FluxKontextModel(BaseModel):
                     
                 control_latent = self.encode_images(control_tensor).to(latents.device, latents.dtype)
                 latents = torch.cat((latents, control_latent), dim=1)
+                if vae_device != self.device_torch:
+                    self.vae = self.vae.to(vae_device)
 
         return latents.detach() 
 
