@@ -1,5 +1,6 @@
 import copy
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ from extensions_built_in.sd_trainer.DiffusionTrainer import DiffusionTrainer
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from toolkit.stable_diffusion_model import StableDiffusion
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight
+from toolkit.prompt_utils import PromptEmbeds
 
 
 class ImageSliderAdvancedConfig:
@@ -67,40 +69,50 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
 
     def build_pair_diff_mask(
         self,
-        *,
         pos_latents: torch.Tensor,
         neg_latents: torch.Tensor,
-        dtype: torch.dtype,
+        blur_ks: int = 5,  # 0 表示不平滑
+        q_low: float = 0.01,  # 分位数替代 min
+        q_high: float = 0.99,  # 分位数替代 max
+        tau: float = 0.2,
+        eps: float = 1e-6,
     ) -> torch.Tensor:
         """
-        Build a per-sample spatial weight map from paired clean latents:
-        m = |pos-neg| normalized to [0,1] by per-sample, per-channel min/max (over spatial dims).
-
-        Returns (B,C,H,W), detached.
+        Returns (B,1,H,W) in [0,1], detached.
         """
-        d = (pos_latents - neg_latents).abs()  # (B,C,H,W)
-        flat = d.flatten(start_dim=2)  # (B,C,HW)
-        d_min = flat.min(dim=2, keepdim=True).values.view(d.shape[0], d.shape[1], 1, 1)
-        d_max = flat.max(dim=2, keepdim=True).values.view(d.shape[0], d.shape[1], 1, 1)
-        m = (d - d_min) / (d_max - d_min + 1e-6)
-        m = m.clamp(0.0, 1.0)
-        return m.to(dtype=dtype).detach()
+        with torch.no_grad():
+            # 用 fp32 计算更稳
+            d = (
+                (pos_latents.float() - neg_latents.float()).abs().mean(dim=1, keepdim=True)
+            )  # (B,1,H,W)
+
+            if blur_ks and blur_ks > 1:
+                pad = blur_ks // 2
+                d = F.avg_pool2d(d, kernel_size=blur_ks, stride=1, padding=pad)
+
+            flat = d.flatten(start_dim=2)  # (B,1,HW)
+            lo = torch.quantile(flat, q_low, dim=2, keepdim=True).view(d.size(0), 1, 1, 1)
+            hi = torch.quantile(flat, q_high, dim=2, keepdim=True).view(d.size(0), 1, 1, 1)
+
+            denom = (hi - lo).clamp_min(eps)
+            m = ((d - lo) / denom).clamp(0.0, 1.0)
+            m = ((m - tau) / (1.0 - tau + eps)).clamp(0.0, 1.0)
+
+        return m.detach()
 
     def get_linearity_loss(
         self,
-        *,
         noisy_latents: torch.Tensor,
         embeds,
         timesteps: torch.Tensor,
         batch: DataLoaderBatchDTO,
         class_pred: torch.Tensor,
-        loss_mask: torch.Tensor | None,
-        m_list: list,
-        weight: float,
-        delta: float,
-        loss_type: str,
-        gate_threshold: float,
-        beta: float,
+        multipliers: list,
+        weight: float = 1.0,
+        delta: float = 0.1,
+        loss_type: str = "smooth_l1",
+        gate_threshold: float = 0.01,
+        beta: float = 0.05,
     ) -> torch.Tensor:
         """
         Linearity loss around current multiplier list.
@@ -121,7 +133,7 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
         with torch.no_grad():
             self.sd.unet.eval()
 
-            m_left = [m - delta for m in m_list]
+            m_left = [m - delta for m in multipliers]
             self._set_network_multiplier(m_left)
             pred_left = self.sd.predict_noise(
                 latents=noisy_latents.to(self.device_torch, dtype=class_pred.dtype).detach(),
@@ -132,7 +144,7 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
                 batch=batch,
             ).detach()
 
-            m_right = [m + delta for m in m_list]
+            m_right = [m + delta for m in multipliers]
             self._set_network_multiplier(m_right)
             pred_right = self.sd.predict_noise(
                 latents=noisy_latents.to(self.device_torch, dtype=class_pred.dtype).detach(),
@@ -160,29 +172,13 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
         else:
             raise ValueError(f"Invalid loss type: {loss_type}")
 
-        if loss_mask is not None:
-            m = loss_mask
-            if m.ndim != 4:
-                raise ValueError(f"loss_mask must be 4D (B,1,H,W) or (B,C,H,W), got {tuple(m.shape)}")
-            if m.shape[1] == 1 and loss_map.shape[1] != 1:
-                m = m.expand(-1, loss_map.shape[1], -1, -1)
-            elif m.shape[1] != loss_map.shape[1]:
-                raise ValueError(
-                    f"loss_mask channel mismatch: mask has {m.shape[1]}, loss_map has {loss_map.shape[1]}"
-                )
-            m = m.to(device=loss_map.device, dtype=loss_map.dtype).detach()
-            denom = m.sum(dim=(1, 2, 3)).clamp_min(1e-6)
-            per = (loss_map * m).sum(dim=(1, 2, 3)) / denom
-        else:
-            per = loss_map.flatten(start_dim=1).mean(dim=1)
-
+        per = loss_map.flatten(start_dim=1).mean(dim=1)
         thr = torch.as_tensor(gate_threshold, device=per.device, dtype=per.dtype)
         per = F.relu(per - thr)
-        return (per * linearity_weight).mean()
+        return (per * linearity_weight)
 
     def _get_loss_target(
         self,
-        *,
         noise: torch.Tensor,
         timesteps: torch.Tensor,
         batch: DataLoaderBatchDTO,
@@ -200,18 +196,79 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             return self.sd.noise_scheduler.get_velocity(batch.latents, noise, timesteps).detach()
         return noise.detach()
 
+    def get_direct_loss(
+        self,
+        noisy_latents: torch.Tensor,
+        conditional_embeds: torch.Tensor,
+        timesteps: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+        noise: torch.Tensor,
+        loss_mask: torch.Tensor | None,
+        multipliers: list,
+        **pred_kwargs: dict,
+    ):
+        self._set_network_multiplier(list(multipliers))
+        pred = self.sd.predict_noise(
+            latents=noisy_latents.to(self.device_torch, dtype=self.sd.torch_dtype).detach(),
+            conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=self.sd.torch_dtype).detach(),
+            timestep=timesteps,
+            guidance_scale=1.0,
+            guidance_embedding_scale=1.0,
+            batch=batch,
+            **pred_kwargs,
+        )
+        target = self._get_loss_target(
+            noise=noise,
+            timesteps=timesteps,
+            batch=batch,
+        )
+        if loss_mask is not None:
+            m = loss_mask.to(device=pred.device, dtype=pred.dtype)
+            w = 1.0 + 10.0 * m
+        else:
+            w = 1.0
+        loss_main = ((pred - target) ** 2) * w
+        loss_main_per = loss_main.flatten(start_dim=1).mean(dim=1)
+        loss_main = loss_main_per.mean()
+
+        linearity_loss_per = self.get_linearity_loss(
+            noisy_latents=noisy_latents,
+            embeds=conditional_embeds,
+            timesteps=timesteps,
+            batch=batch,
+            class_pred=pred,
+            multipliers=multipliers,
+            weight=self.slider_config.linearity_weight,
+            delta=self.slider_config.linearity_delta,
+            loss_type=self.slider_config.linearity_loss_type,
+            gate_threshold=self.slider_config.linearity_gate_threshold,
+            beta=self.slider_config.linearity_beta,
+        )
+        linearity_loss_per = self.cap_aux(
+            linearity_loss_per,
+            loss_main_per,
+            ratio=self.slider_config.cap_ratio,
+            main_floor=self.slider_config.cap_main_floor,
+            eps=self.slider_config.cap_eps,
+        )
+        linearity_loss = linearity_loss_per.mean()
+        loss_total = loss_main + linearity_loss
+
+        loss_total.backward()
+        loss_total = loss_total.detach()
+        return loss_total
+
     def get_guided_loss(
         self,
         noisy_latents: torch.Tensor,
-        conditional_embeds,
+        conditional_embeds: PromptEmbeds,
         match_adapter_assist: bool,
         network_weight_list: list,
         timesteps: torch.Tensor,
         pred_kwargs: dict,
         batch: "DataLoaderBatchDTO",
         noise: torch.Tensor,
-        unconditional_embeds=None,
-        mask_multiplier=None,
+        unconditional_embeds: Optional[PromptEmbeds] = None,
         **kwargs,
     ):
         """
@@ -270,12 +327,7 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             diff_mask = self.build_pair_diff_mask(
                 pos_latents=conditional_latents,
                 neg_latents=unconditional_latents,
-                dtype=dtype,
             )
-        linearity_mask = diff_mask
-        if mask_multiplier is not None:
-            # mask_multiplier is typically (B,C,H,W); multiply channel-wise when possible.
-            linearity_mask = linearity_mask * mask_multiplier.to(device=device, dtype=dtype)
 
         # get noisy latents for the neg/pair image and condition them with the same controls/masks/etc
         unconditional_noisy = self.sd.add_noise(unconditional_latents, noise, timesteps).detach()
@@ -284,127 +336,35 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             unconditional_noisy = self.adapter.condition_noisy_latents(unconditional_noisy, batch_neg)
 
         # Set per-sample multipliers for polarity (+ for pos, - for neg).
-        pos_mult = list(network_weight_list)
-        neg_mult = list(network_weight_list)
+        pos_mult = [weight * 1.0 for weight in network_weight_list]
+        neg_mult = [weight * -1.0 for weight in network_weight_list]
         old_multiplier = self.network.multiplier
 
-        # -----------------------
-        # POS pass (train +weight)
-        # -----------------------
-        self._set_network_multiplier(list(pos_mult))
-        pred_pos = self.sd.predict_noise(
-            latents=conditional_noisy.to(device, dtype=dtype).detach(),
-            conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
-            timestep=timesteps,
-            guidance_scale=1.0,
-            guidance_embedding_scale=1.0,
-            batch=batch_pos,
-            **pred_kwargs,
-        )
-        target_pos = self._get_loss_target(
-            noise=noise,
+        loss_pos_total = self.get_direct_loss(
+            noisy_latents=conditional_noisy,
+            conditional_embeds=conditional_embeds,
             timesteps=timesteps,
             batch=batch_pos,
-        )
-        m = diff_mask
-        if m.shape[1] == 1 and pred_pos.shape[1] != 1:
-            m = m.expand(-1, pred_pos.shape[1], -1, -1)
-        if mask_multiplier is not None:
-            m = m * mask_multiplier.to(device=device, dtype=dtype)
-        loss_pos_vec = ((pred_pos.float() - target_pos.float()) ** 2) * m.float()
-        loss_pos_vec = loss_pos_vec.mean([1, 2, 3])
-        if self.train_config.min_snr_gamma is not None and self.train_config.min_snr_gamma > 1e-6:
-            loss_pos_vec = apply_snr_weight(loss_pos_vec, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
-        loss_pos_main = loss_pos_vec.mean()
-
-        loss_pos_total = loss_pos_main
-        if self.slider_config.linearity_weight > 1e-6:
-            lin_pos = self.get_linearity_loss(
-                noisy_latents=conditional_noisy,
-                embeds=conditional_embeds,
-                timesteps=timesteps,
-                batch=batch_pos,
-                class_pred=pred_pos,
-                loss_mask=linearity_mask,
-                m_list=list(pos_mult),
-                weight=self.slider_config.linearity_weight,
-                delta=self.slider_config.linearity_delta,
-                loss_type=self.slider_config.linearity_loss_type,
-                gate_threshold=self.slider_config.linearity_gate_threshold,
-                beta=self.slider_config.linearity_beta,
-            )
-            lin_pos = self.cap_aux(
-                lin_pos,
-                loss_pos_main,
-                ratio=self.slider_config.cap_ratio,
-                main_floor=self.slider_config.cap_main_floor,
-                eps=self.slider_config.cap_eps,
-            )
-            loss_pos_total = loss_pos_total + lin_pos
-
-        self.accelerator.backward(loss_pos_total)
-
-        # -----------------------
-        # NEG pass (train -weight)
-        # -----------------------
-        neg_multiplier = [(-w) for w in neg_mult]
-        self._set_network_multiplier(neg_multiplier)
-        pred_neg = self.sd.predict_noise(
-            latents=unconditional_noisy.to(device, dtype=dtype).detach(),
-            conditional_embeddings=conditional_embeds.to(device, dtype=dtype).detach(),
-            timestep=timesteps,
-            guidance_scale=1.0,
-            guidance_embedding_scale=1.0,
-            batch=batch_neg,
+            noise=noise,
+            loss_mask=diff_mask,
+            multipliers=pos_mult,
             **pred_kwargs,
         )
-        target_neg = self._get_loss_target(
-            noise=noise,
+        loss_neg_total = self.get_direct_loss(
+            noisy_latents=unconditional_noisy,
+            conditional_embeds=conditional_embeds,
             timesteps=timesteps,
             batch=batch_neg,
+            noise=noise,
+            loss_mask=diff_mask,
+            multipliers=neg_mult,
+            **pred_kwargs,
         )
-        m = diff_mask
-        if m.shape[1] == 1 and pred_neg.shape[1] != 1:
-            m = m.expand(-1, pred_neg.shape[1], -1, -1)
-        if mask_multiplier is not None:
-            m = m * mask_multiplier.to(device=device, dtype=dtype)
-        loss_neg_vec = ((pred_neg.float() - target_neg.float()) ** 2) * m.float()
-        loss_neg_vec = loss_neg_vec.mean([1, 2, 3])
-        if self.train_config.min_snr_gamma is not None and self.train_config.min_snr_gamma > 1e-6:
-            loss_neg_vec = apply_snr_weight(loss_neg_vec, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
-        loss_neg_main = loss_neg_vec.mean()
-
-        loss_neg_total = loss_neg_main
-        if self.slider_config.linearity_weight > 1e-6:
-            lin_neg = self.get_linearity_loss(
-                noisy_latents=unconditional_noisy,
-                embeds=conditional_embeds,
-                timesteps=timesteps,
-                batch=batch_neg,
-                class_pred=pred_neg,
-                loss_mask=linearity_mask,
-                m_list=neg_multiplier,
-                weight=self.slider_config.linearity_weight,
-                delta=self.slider_config.linearity_delta,
-                loss_type=self.slider_config.linearity_loss_type,
-                gate_threshold=self.slider_config.linearity_gate_threshold,
-                beta=self.slider_config.linearity_beta,
-            )
-            lin_neg = self.cap_aux(
-                lin_neg,
-                loss_neg_main,
-                ratio=self.slider_config.cap_ratio,
-                main_floor=self.slider_config.cap_main_floor,
-                eps=self.slider_config.cap_eps,
-            )
-            loss_neg_total = loss_neg_total + lin_neg
-
-        self.accelerator.backward(loss_neg_total)
 
         # restore network multiplier for parent code
         self._set_network_multiplier(old_multiplier)
 
         # detach it so parent class can run backward without error
-        total_loss = (loss_pos_total.detach() + loss_neg_total.detach()) / 2.0
+        total_loss = (loss_pos_total + loss_neg_total) / 2.0
         total_loss.requires_grad_(True)
         return total_loss
