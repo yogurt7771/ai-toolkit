@@ -71,34 +71,46 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
         self,
         pos_latents: torch.Tensor,
         neg_latents: torch.Tensor,
-        blur_ks: int = 5,  # 0 表示不平滑
-        q_low: float = 0.01,  # 分位数替代 min
-        q_high: float = 0.99,  # 分位数替代 max
+        blur_ks: int = 5,
+        q_low: float = 0.01,
+        q_high: float = 0.99,
         tau: float = 0.2,
+        channelwise: bool = True,
         eps: float = 1e-6,
     ) -> torch.Tensor:
         """
-        Returns (B,1,H,W) in [0,1], detached.
+        If channelwise=False: returns m  (B,1,H,W) in [0,1]
+        If channelwise=True : returns mc (B,C,H,W) in [0,1]
+        Both detached.
         """
         with torch.no_grad():
-            # 用 fp32 计算更稳
-            d = (
-                (pos_latents.float() - neg_latents.float()).abs().mean(dim=1, keepdim=True)
-            )  # (B,1,H,W)
+            # d: (B,C,H,W)
+            d = (pos_latents.float() - neg_latents.float()).abs()
 
             if blur_ks and blur_ks > 1:
                 pad = blur_ks // 2
                 d = F.avg_pool2d(d, kernel_size=blur_ks, stride=1, padding=pad)
 
-            flat = d.flatten(start_dim=2)  # (B,1,HW)
-            lo = torch.quantile(flat, q_low, dim=2, keepdim=True).view(d.size(0), 1, 1, 1)
-            hi = torch.quantile(flat, q_high, dim=2, keepdim=True).view(d.size(0), 1, 1, 1)
+            # --- 1) spatial strength s: (B,1,H,W) ---
+            s = d.mean(dim=1, keepdim=True)
+            flat = s.flatten(start_dim=2)  # (B,1,HW)
+            lo = torch.quantile(flat, q_low, dim=2, keepdim=True).view(s.size(0), 1, 1, 1)
+            hi = torch.quantile(flat, q_high, dim=2, keepdim=True).view(s.size(0), 1, 1, 1)
+            s = ((s - lo) / (hi - lo + eps)).clamp(0.0, 1.0)
 
-            denom = (hi - lo).clamp_min(eps)
-            m = ((d - lo) / denom).clamp(0.0, 1.0)
-            m = ((m - tau) / (1.0 - tau + eps)).clamp(0.0, 1.0)
+            tau = float(max(0.0, min(tau, 0.99)))
+            s = ((s - tau) / (1.0 - tau + eps)).clamp(0.0, 1.0)  # (B,1,H,W)
 
-        return m.detach()
+            if not channelwise:
+                return s.detach()
+
+            # --- 2) channel distribution p: (B,C,H,W), sum_c p = 1 ---
+            p = d / (d.sum(dim=1, keepdim=True) + eps)
+
+            C = d.shape[1]
+            mc = (s * p * C).clamp(0.0, 1.0)  # (B,C,H,W)
+
+            return mc.detach()
 
     def get_linearity_loss(
         self,
@@ -276,17 +288,15 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             timesteps=timesteps,
             batch=batch,
         )
-        if loss_mask is not None:
-            m = loss_mask.to(device=pred.device, dtype=pred.dtype)
+
+        if loss_mask is None:
+            mc = torch.ones_like(pred)  # (B,C,H,W)
         else:
-            m = torch.ones(
-                (pred.shape[0], 1, pred.shape[2], pred.shape[3]),
-                device=pred.device,
-                dtype=pred.dtype,
-            )
-        tau = 0.1
-        m = ((m - tau) / (1.0 - tau + 1e-6)).clamp(0.0, 1.0)  # (B,1,H,W)
-        mc = m.expand(-1, pred.shape[1], -1, -1)
+            m = loss_mask.to(device=pred.device, dtype=pred.dtype)
+            if m.shape[1] == 1:
+                mc = m.expand(-1, pred.shape[1], -1, -1)  # (B,1,H,W)->(B,C,H,W)
+            else:
+                mc = m  # already (B,C,H,W)
 
         edit_loss_per = self.get_edit_loss(
             target=target,
@@ -304,7 +314,13 @@ class ImageSliderAdvancedTrainerProcess(DiffusionTrainer):
             mc=mc,
         )
 
-        keep_cap_per = self.cap_aux(keep_loss_per, edit_loss_per, ratio=0.5, main_floor=self.slider_config.cap_main_floor, eps=self.slider_config.cap_eps)
+        keep_loss_per = self.cap_aux(
+            keep_loss_per,
+            edit_loss_per,
+            ratio=0.5,
+            main_floor=self.slider_config.cap_main_floor,
+            eps=self.slider_config.cap_eps,
+        )
 
         loss_main_per = edit_loss_per + keep_loss_per
         loss_main = loss_main_per.mean()
